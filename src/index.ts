@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { resolve } from 'node:path'
-import process from 'node:process'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path/posix'
+import process, { exit } from 'node:process'
+import { parseArgs } from 'node:util'
 import { AGENT_METHODS, CLIENT_METHODS, PROTOCOL_METHODS } from '@agentclientprotocol/sdk'
 import { WebSocket, WebSocketServer } from 'ws'
 
@@ -86,9 +86,6 @@ type PermissionBroadcast = {
 	resolved: boolean
 }
 
-const DEFAULT_HOST = '127.0.0.1'
-const DEFAULT_PORT = 7331
-const DEFAULT_PATH = '/acp'
 const JSON_RPC_VERSION = '2.0'
 const INTERNAL_ERROR = -32603
 const METHOD_NOT_FOUND = -32601
@@ -790,64 +787,6 @@ export async function startProxy(options: ProxyOptions): Promise<AcpToWsProxy> {
 	return proxy
 }
 
-export function parseCliOptions(argv: string[]): ProxyOptions {
-	let host = process.env['HOST'] ?? DEFAULT_HOST
-	let port = parsePort(process.env['PORT'], DEFAULT_PORT)
-	let path = process.env['ACP_PATH'] ?? DEFAULT_PATH
-	let commandArgs: string[] | undefined
-	for (let index = 0; index < argv.length; index += 1) {
-		const arg = argv[index]
-		if (arg === '--') {
-			commandArgs = argv.slice(index + 1)
-			break
-		}
-		if (arg === '--help' || arg === '-h') {
-			printUsage()
-			process.exit(0)
-		}
-		if (arg === '--host') {
-			host = readOptionValue(argv, (index += 1), '--host')
-			continue
-		}
-		if (arg.startsWith('--host=')) {
-			host = arg.slice('--host='.length)
-			continue
-		}
-		if (arg === '--port') {
-			port = parsePort(readOptionValue(argv, (index += 1), '--port'), DEFAULT_PORT)
-			continue
-		}
-		if (arg.startsWith('--port=')) {
-			port = parsePort(arg.slice('--port='.length), DEFAULT_PORT)
-			continue
-		}
-		if (arg === '--path') {
-			path = readOptionValue(argv, (index += 1), '--path')
-			continue
-		}
-		if (arg.startsWith('--path=')) {
-			path = arg.slice('--path='.length)
-			continue
-		}
-		if (arg.startsWith('-')) {
-			throw new Error(`Unknown option: ${arg}`)
-		}
-		commandArgs = argv.slice(index)
-		break
-	}
-	if (!commandArgs || commandArgs.length === 0) {
-		printUsage()
-		throw new Error('Missing stdio ACP agent command')
-	}
-	return {
-		args: commandArgs.slice(1),
-		command: commandArgs[0] ?? '',
-		host,
-		path: normalizePath(path),
-		port,
-	}
-}
-
 function readNdJson(child: ChildProcessWithoutNullStreams, onMessage: (message: JsonRpcMessage) => void, onError: (error: unknown) => void): void {
 	let buffer = ''
 	let stopped = false
@@ -1047,44 +986,6 @@ function splitLogLines(chunk: string): string[] {
 		.filter(line => line.length > 0)
 }
 
-function readOptionValue(argv: string[], index: number, optionName: string): string {
-	const value = argv[index]
-	if (!value) {
-		throw new Error(`Missing value for ${optionName}`)
-	}
-	return value
-}
-
-function parsePort(value: string | undefined, fallback: number): number {
-	if (!value) {
-		return fallback
-	}
-	const port = Number.parseInt(value, 10)
-	if (!Number.isSafeInteger(port) || port < 0 || port > 65535) {
-		throw new Error(`Invalid port: ${value}`)
-	}
-	return port
-}
-
-function normalizePath(path: string): string {
-	const normalized = path.trim()
-	if (!normalized.startsWith('/')) {
-		return `/${normalized}`
-	}
-	return normalized
-}
-
-function formatCommand(command: string, args: string[]): string {
-	return [command, ...args].map(quoteShellish).join(' ')
-}
-
-function quoteShellish(value: string): string {
-	if (/^[\w./:@-]+$/.test(value)) {
-		return value
-	}
-	return JSON.stringify(value)
-}
-
 function safeJson(value: unknown): string {
 	try {
 		return JSON.stringify(value)
@@ -1100,32 +1001,56 @@ function formatError(error: unknown): string {
 	return safeJson(error)
 }
 
-function printUsage(): void {
-	console.log(`Usage:
-  acp-to-ws [--host 127.0.0.1] [--port 7331] [--path /acp] -- <stdio-agent-command> [args...]
+const DEFAULT_HOST = '127.0.0.1'
+const DEFAULT_PORT = '80'
+const DEFAULT_PATH = '/acp'
+
+const {
+	positionals: [command, ...args],
+	values: { help, host, path, port },
+} = parseArgs({
+	allowPositionals: true,
+	options: {
+		help: {
+			short: 'h',
+			type: 'boolean',
+		},
+		host: {
+			default: DEFAULT_HOST,
+			type: 'string',
+		},
+		path: {
+			default: DEFAULT_PATH,
+			type: 'string',
+		},
+		port: {
+			default: DEFAULT_PORT,
+			type: 'string',
+		},
+	},
+})
+
+if (help || !(command && host && path && port)) {
+	console.error(`Usage:
+	acp-to-ws [--host <host>] [--port <port>] [--path <path>] -- <stdio-agent-command> [args...]
 
 Examples:
-  acp-to-ws --port 7331 -- npx tsx ./agent.ts
-  node dist/index.js --host 0.0.0.0 --port 7331 -- node ./dist/agent.js
+	acp-to-ws --port 80 -- npx tsx ./agent.ts
+	node dist/index.js --host 0.0.0.0 --port 80 -- node ./dist/agent.js
 
-Environment:
-  HOST       Defaults to ${DEFAULT_HOST}
-  PORT       Defaults to ${DEFAULT_PORT}
-  ACP_PATH   Defaults to ${DEFAULT_PATH}`)
+Args:
+	<host>  Defaults to ${DEFAULT_HOST}
+	<path>  Defaults to ${DEFAULT_PATH}
+	<port>  Defaults to ${DEFAULT_PORT}`)
+	exit(1)
 }
 
-async function main(): Promise<void> {
-	const options = parseCliOptions(process.argv.slice(2))
-	const proxy = await startProxy(options)
-	console.log(`[proxy] ACP WebSocket endpoint listening at ${proxy.url}`)
-	console.log(`[proxy] stdio agent command: ${formatCommand(options.command, options.args)}`)
-}
-
-const isMainModule = process.argv[1] ? fileURLToPath(import.meta.url) === resolve(process.argv[1]) : false
-
-if (isMainModule) {
-	main().catch(error => {
-		console.error(`[proxy] ${formatError(error)}`)
-		process.exit(1)
-	})
-}
+const proxy = await startProxy({
+	args,
+	command,
+	host,
+	path: join('/', path),
+	port: parseInt(port),
+})
+console.log(`[proxy] ACP WebSocket endpoint listening at ${proxy.url}`)
+console.log(`[proxy] stdio agent command: ${command} ${args}`)
