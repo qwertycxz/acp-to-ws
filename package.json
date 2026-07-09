@@ -1,0 +1,54 @@
+{
+	"$schema": "https://schemastore.org/package",
+	"author": "qwertycxz",
+	"bugs": "https://github.com/qwertycxz/acp-to-ws/issues",
+	"dependencies": {
+		"@agentclientprotocol/sdk": "^1.1.0",
+		"ws": "^8.21.0"
+	},
+	"description": "Redirect ACP to WebSocket",
+	"bin": {
+		"acp-to-ws": "./dist/index.js"
+	},
+	"devDependencies": {
+		"@types/node": "^26.1.0",
+		"@types/ws": "^8.18.1",
+		"prettier": "^3.9.4",
+		"typescript": "^6.0.3"
+	},
+	"funding": "https://ko-fi.com/qwertycxz",
+	"keywords": [
+		"acp"
+	],
+	"license": "Apache-2.0",
+	"main": "./dist/index.js",
+	"name": "acp-to-ws",
+	"prettier": {
+		"arrowParens": "avoid",
+		"jsxSingleQuote": true,
+		"overrides": [
+			{
+				"files": "*.yml",
+				"options": {
+					"tabWidth": 2
+				}
+			}
+		],
+		"printWidth": 256,
+		"proseWrap": "never",
+		"quoteProps": "consistent",
+		"semi": false,
+		"singleQuote": true,
+		"tabWidth": 4,
+		"useTabs": true
+	},
+	"repository": "https://github.com/qwertycxz/acp-to-ws",
+	"scripts": {
+		"build": "tsc",
+		"check": "tsc --noEmit",
+		"start": "node dist/index.js",
+		"test": "npm run build && node --test dist/**/*.test.js"
+	},
+	"type": "module",
+	"version": "0.0.1"
+}
