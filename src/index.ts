@@ -117,23 +117,6 @@ function sendSocketMessage(socket: WebSocket, message: AnyMessage) {
 	})
 }
 
-function waitForWebSocketServer(server: WebSocketServer) {
-	return new Promise<void>((resolve, reject) => {
-		const onError = (error: Error) => {
-			server.off('listening', onListening)
-			reject(error)
-		}
-
-		const onListening = () => {
-			server.off('error', onError)
-			resolve()
-		}
-
-		server.once('error', onError)
-		server.once('listening', onListening)
-	})
-}
-
 function isSessionSetupMethod(method: string): method is SessionSetupMethod {
 	return method === METHOD_SESSION_LOAD || method === METHOD_SESSION_NEW || method === METHOD_SESSION_RESUME
 }
@@ -351,38 +334,44 @@ const stdioAgent = spawn(command, args, {
 	stdio: ['overlapped', 'overlapped', 'inherit'],
 })
 
+stdioAgent.on('error', error => {
+	console.error('Failed to start ACP agent:', error)
+	process.exit(1)
+})
+
+stdioAgent.on('exit', (code, signal) => {
+	if (signal) {
+		console.error(`ACP agent exited after signal ${signal}`)
+	}
+
+	if (code == null) {
+		code = 1
+	}
+	process.exit(code)
+})
+
+const { readable, writable } = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
+
+async function readStdout() {
+	for await (const message of readable) {
+		await receiveAgentMessage(message)
+	}
+	process.exit()
+}
+void readStdout()
+
+const agentStdin = writable.getWriter()
+
 const wsServer = new WebSocketServer({
 	host,
 	path: join('/', path),
 	port: parseInt(port),
 })
 
-function gracefulStop() {
-	stdioAgent.kill()
-	wsServer.close()
-}
-
-stdioAgent.on('error', error => {
-	console.error('Failed to start ACP agent:', error)
-	process.exitCode = 1
-	gracefulStop()
+wsServer.on('error', error => {
+	console.error('ACP WebSocket server error:', error)
+	process.exit(1)
 })
-
-stdioAgent.on('exit', (code, signal) => {
-	if (typeof code === 'number' && code !== 0) {
-		process.exitCode = code
-	}
-
-	if (signal) {
-		console.error(`ACP agent exited after signal ${signal}`)
-	}
-
-	gracefulStop()
-})
-
-const { readable, writable } = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
-const agentWriter = writable.getWriter()
-const webSocketServerListening = waitForWebSocketServer(wsServer)
 
 let activePromptTurn: ActivePromptTurn | undefined
 let cachedInitializeResponse: JsonRpcPayload | undefined
@@ -398,10 +387,6 @@ const clientAgentRequestLookup = new Map<string, string>()
 const clientRequestToAgentId = new Map<string, JsonRpcId>()
 const pendingAgentRequests = new Map<string, PendingAgentRequest>()
 const pendingAgentResponses = new Map<string, PendingAgentResponse>()
-
-function sendAgentMessage(message: AnyMessage) {
-	return agentWriter.write(message as AnyMessage)
-}
 
 function addClient(sendMessage: (message: AnyMessage) => Promise<void>, close: () => void) {
 	const previousClient = connectedClient
@@ -534,7 +519,7 @@ async function receiveInitializeRequest(clientId: number, request: AnyRequest) {
 		kind: 'initialize',
 		waiters: [{ clientId, clientRequestId: request.id }],
 	})
-	await sendAgentMessage(requestWithId(request, agentRequestId))
+	await agentStdin.write(requestWithId(request, agentRequestId))
 }
 
 async function receiveSessionSetupDuringPrompt(clientId: number, request: AnyRequest, originalMethod: SessionSetupMethod) {
@@ -554,7 +539,7 @@ async function receiveSessionSetupDuringPrompt(clientId: number, request: AnyReq
 		sessionId: cachedLoadParams.sessionId,
 	})
 	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-	await sendAgentMessage(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
+	await agentStdin.write(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
 }
 
 async function forwardPromptRequest(clientId: number, request: AnyRequest) {
@@ -570,7 +555,7 @@ async function forwardPromptRequest(clientId: number, request: AnyRequest) {
 		sessionId: stringProperty(request.params, 'sessionId') ?? cachedSessionLoad?.sessionId,
 		deferredSetupResponses: [],
 	}
-	await sendAgentMessage(requestWithId(request, agentRequestId))
+	await agentStdin.write(requestWithId(request, agentRequestId))
 }
 
 async function forwardClientRequest(clientId: number, request: AnyRequest) {
@@ -583,7 +568,7 @@ async function forwardClientRequest(clientId: number, request: AnyRequest) {
 		params: request.params,
 	})
 	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-	await sendAgentMessage(requestWithId(request, agentRequestId))
+	await agentStdin.write(requestWithId(request, agentRequestId))
 }
 
 async function receiveClientResponse(clientId: number, response: AnyResponse) {
@@ -601,7 +586,7 @@ async function receiveClientResponse(clientId: number, response: AnyResponse) {
 
 	state.settled = true
 	clearAgentRequestState(state)
-	await sendAgentMessage(responseWithId(response, state.agentRequestId))
+	await agentStdin.write(responseWithId(response, state.agentRequestId))
 }
 
 async function receiveClientNotification(clientId: number, notification: AnyNotification) {
@@ -620,7 +605,7 @@ async function receiveClientNotification(clientId: number, notification: AnyNoti
 		const agentRequestId = clientRequestToAgentId.get(clientRequestKeyValue)
 
 		if (agentRequestId !== undefined) {
-			await sendAgentMessage(cancelRequestNotification(agentRequestId, notification.params))
+			await agentStdin.write(cancelRequestNotification(agentRequestId, notification.params))
 			return
 		}
 
@@ -628,13 +613,13 @@ async function receiveClientNotification(clientId: number, notification: AnyNoti
 		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
 
 		if (state) {
-			await sendAgentMessage(cancelRequestNotification(state.agentRequestId, notification.params))
+			await agentStdin.write(cancelRequestNotification(state.agentRequestId, notification.params))
 		}
 
 		return
 	}
 
-	await sendAgentMessage(notification)
+	await agentStdin.write(notification)
 }
 
 async function receiveAgentRequest(request: AnyRequest) {
@@ -896,19 +881,4 @@ wsServer.on('connection', socket => {
 	})
 })
 
-async function readStdout() {
-	for await (const message of readable) {
-		await receiveAgentMessage(message)
-	}
-	gracefulStop()
-}
-
-void readStdout()
-
-try {
-	await webSocketServerListening
-	console.error(`ACP WebSocket proxy listening at ws://${host}:${port}${path}`)
-} catch (error) {
-	gracefulStop()
-	throw error
-}
+console.error(`ACP WebSocket proxy listening at ws://${host}:${port}${path}`)
