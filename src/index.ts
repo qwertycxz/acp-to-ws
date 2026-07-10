@@ -3,29 +3,15 @@ import { spawn } from 'node:child_process'
 import { join } from 'node:path/posix'
 import { Readable, Writable } from 'node:stream'
 import { parseArgs } from 'node:util'
-import {
-	methods,
-	ndJsonStream,
-	RequestError,
-	type AnyMessage,
-	type AnyNotification,
-	type AnyRequest,
-	type AnyResponse,
-	type ErrorResponse,
-	type JsonRpcId,
-} from '@agentclientprotocol/sdk'
+import { methods, ndJsonStream, RequestError, type AnyMessage, type AnyNotification, type AnyRequest, type AnyResponse, type ErrorResponse, type JsonRpcId } from '@agentclientprotocol/sdk'
 import { WebSocket, WebSocketServer, type RawData } from 'ws'
 
-type JsonRpcRequest = AnyRequest
-type JsonRpcResponse = AnyResponse
-type JsonRpcNotification = AnyNotification
-type JsonRpcMessage = AnyMessage
 type JsonRpcPayload = { result: unknown } | { error: ErrorResponse }
 
 type ConnectedClient = {
 	id: number
 	close: () => void
-	sendMessage: (message: JsonRpcMessage) => Promise<void>
+	sendMessage: (message: AnyMessage) => Promise<void>
 }
 
 type InitializePendingResponse = {
@@ -63,7 +49,7 @@ type PendingAgentResponse = InitializePendingResponse | ClientPendingResponse | 
 type PendingAgentRequest = {
 	stateId: string
 	agentRequestId: JsonRpcId
-	request: JsonRpcRequest
+	request: AnyRequest
 	deliveredClientId: number | undefined
 	deliveredClientRequestId: JsonRpcId | undefined
 	settled: boolean
@@ -77,7 +63,7 @@ type CachedLoadParams = Record<string, unknown> & {
 
 type DeferredPromptSetupResponse = {
 	clientId: number
-	response: JsonRpcResponse
+	response: AnyResponse
 }
 
 type ActivePromptTurn = {
@@ -97,502 +83,6 @@ type SessionSetupMethod = typeof METHOD_SESSION_LOAD | typeof METHOD_SESSION_NEW
 
 const ERROR_CODE_CONFLICT = -32099
 
-class AcpRecoveringProxy {
-	private activePromptTurn: ActivePromptTurn | undefined
-	private cachedInitializeResponse?: JsonRpcPayload
-	private cachedSessionLoad?: CachedLoadParams
-	private client: ConnectedClient | undefined
-	private initializeAgentRequestId: JsonRpcId | undefined
-	private nextClientId = 1
-	private nextMessageId = 1
-	private nextRequestStateId = 1
-	private readonly agentRequestStateByAgentId = new Map<string, string>()
-	private readonly clientAgentRequestLookup = new Map<string, string>()
-	private readonly clientRequestToAgentId = new Map<string, JsonRpcId>()
-	private readonly pendingAgentRequests = new Map<string, PendingAgentRequest>()
-	private readonly pendingAgentResponses = new Map<string, PendingAgentResponse>()
-	private readonly sendAgentMessage: (message: JsonRpcMessage) => Promise<void>
-
-	constructor(options: { sendAgentMessage: (message: JsonRpcMessage) => Promise<void> }) {
-		this.sendAgentMessage = options.sendAgentMessage
-	}
-
-	addClient(sendMessage: (message: JsonRpcMessage) => Promise<void>, close: () => void) {
-		const previousClient = this.client
-
-		if (previousClient) {
-			this.removeClient(previousClient.id)
-			previousClient.close()
-		}
-
-		const clientId = this.nextClientId++
-		this.client = { id: clientId, close, sendMessage }
-		void this.flushPendingAgentRequests()
-		return clientId
-	}
-
-	removeClient(clientId: number) {
-		if (this.client?.id === clientId) {
-			this.client = undefined
-		}
-
-		for (const key of Array.from(this.clientRequestToAgentId.keys())) {
-			if (key.startsWith(`${clientId}:`)) {
-				this.clientRequestToAgentId.delete(key)
-			}
-		}
-
-		for (const key of Array.from(this.clientAgentRequestLookup.keys())) {
-			if (key.startsWith(`${clientId}:`)) {
-				this.clientAgentRequestLookup.delete(key)
-			}
-		}
-
-		for (const pending of this.pendingAgentResponses.values()) {
-			if (pending.kind === 'initialize') {
-				pending.waiters = pending.waiters.filter(waiter => waiter.clientId !== clientId)
-			}
-		}
-
-		if (this.activePromptTurn) {
-			this.activePromptTurn.deferredSetupResponses = this.activePromptTurn.deferredSetupResponses.filter(response => response.clientId !== clientId)
-		}
-
-		for (const state of this.pendingAgentRequests.values()) {
-			if (state.deliveredClientId === clientId) {
-				this.clearDeliveredAgentRequest(state)
-			}
-		}
-	}
-
-	async receiveClientMessage(clientId: number, message: JsonRpcMessage) {
-		if (isRequestMessage(message)) {
-			await this.receiveClientRequest(clientId, message)
-			return
-		}
-
-		if (isResponseMessage(message)) {
-			await this.receiveClientResponse(clientId, message)
-			return
-		}
-
-		await this.receiveClientNotification(clientId, message)
-	}
-
-	async receiveAgentMessage(message: JsonRpcMessage) {
-		if (isRequestMessage(message)) {
-			await this.receiveAgentRequest(message)
-			return
-		}
-
-		if (isResponseMessage(message)) {
-			await this.receiveAgentResponse(message)
-			return
-		}
-
-		await this.receiveAgentNotification(message)
-	}
-
-	private async receiveClientRequest(clientId: number, request: JsonRpcRequest) {
-		if (!this.isCurrentClient(clientId)) {
-			return
-		}
-
-		if (request.method === METHOD_INITIALIZE) {
-			await this.receiveInitializeRequest(clientId, request)
-			return
-		}
-
-		if (this.activePromptTurn) {
-			if (request.method === METHOD_SESSION_PROMPT) {
-				await this.sendToClient(clientId, makeErrorResponse(request.id, new RequestError(ERROR_CODE_CONFLICT, 'A prompt turn is already running.', { activeSessionId: this.activePromptTurn.sessionId ?? null })))
-				return
-			}
-
-			if (isSessionSetupMethod(request.method)) {
-				await this.receiveSessionSetupDuringPrompt(clientId, request, request.method)
-				return
-			}
-		}
-
-		if (request.method === METHOD_SESSION_LOAD || request.method === METHOD_SESSION_RESUME) {
-			this.mergeSessionCache(request.params)
-		}
-
-		if (request.method === METHOD_SESSION_PROMPT) {
-			await this.forwardPromptRequest(clientId, request)
-			return
-		}
-
-		await this.forwardClientRequest(clientId, request)
-	}
-
-	private async receiveInitializeRequest(clientId: number, request: JsonRpcRequest) {
-		if (this.cachedInitializeResponse) {
-			await this.sendResponsePayload(clientId, request.id, this.cachedInitializeResponse)
-			return
-		}
-
-		if (this.initializeAgentRequestId !== undefined) {
-			const pending = this.pendingAgentResponses.get(idKey(this.initializeAgentRequestId))
-
-			if (pending?.kind === 'initialize') {
-				pending.waiters.push({ clientId, clientRequestId: request.id })
-				return
-			}
-		}
-
-		const agentRequestId = this.nextProxyRequestId('initialize')
-		this.initializeAgentRequestId = agentRequestId
-		this.pendingAgentResponses.set(idKey(agentRequestId), {
-			kind: 'initialize',
-			waiters: [{ clientId, clientRequestId: request.id }],
-		})
-		await this.sendAgentMessage(requestWithId(request, agentRequestId))
-	}
-
-	private async receiveSessionSetupDuringPrompt(clientId: number, request: JsonRpcRequest, originalMethod: SessionSetupMethod) {
-		const cachedLoadParams = this.cachedSessionLoad
-
-		if (!cachedLoadParams) {
-			await this.sendToClient(clientId, makeErrorResponse(request.id, RequestError.internalError(undefined, 'No cached session/load parameters are available for prompt-turn recovery.')))
-			return
-		}
-
-		const agentRequestId = this.nextProxyRequestId('session-load')
-		this.pendingAgentResponses.set(idKey(agentRequestId), {
-			kind: 'promptSetup',
-			clientId,
-			clientRequestId: request.id,
-			originalMethod,
-			sessionId: cachedLoadParams.sessionId,
-		})
-		this.clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-		await this.sendAgentMessage(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
-	}
-
-	private async forwardPromptRequest(clientId: number, request: JsonRpcRequest) {
-		const agentRequestId = this.nextProxyRequestId('prompt')
-		this.pendingAgentResponses.set(idKey(agentRequestId), {
-			kind: 'prompt',
-			clientId,
-			clientRequestId: request.id,
-		})
-		this.clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-		this.activePromptTurn = {
-			agentPromptRequestId: agentRequestId,
-			sessionId: stringProperty(request.params, 'sessionId') ?? this.cachedSessionLoad?.sessionId,
-			deferredSetupResponses: [],
-		}
-		await this.sendAgentMessage(requestWithId(request, agentRequestId))
-	}
-
-	private async forwardClientRequest(clientId: number, request: JsonRpcRequest) {
-		const agentRequestId = this.nextProxyRequestId('client')
-		this.pendingAgentResponses.set(idKey(agentRequestId), {
-			kind: 'client',
-			clientId,
-			clientRequestId: request.id,
-			method: request.method,
-			params: request.params,
-		})
-		this.clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-		await this.sendAgentMessage(requestWithId(request, agentRequestId))
-	}
-
-	private async receiveClientResponse(clientId: number, response: JsonRpcResponse) {
-		const stateId = this.clientAgentRequestLookup.get(clientRequestKey(clientId, response.id))
-
-		if (!stateId) {
-			return
-		}
-
-		const state = this.pendingAgentRequests.get(stateId)
-
-		if (!state || state.settled) {
-			return
-		}
-
-		state.settled = true
-		this.clearAgentRequestState(state)
-		await this.sendAgentMessage(responseWithId(response, state.agentRequestId))
-	}
-
-	private async receiveClientNotification(clientId: number, notification: JsonRpcNotification) {
-		if (!this.isCurrentClient(clientId)) {
-			return
-		}
-
-		if (notification.method === METHOD_CANCEL_REQUEST) {
-			const requestId = requestIdFromParams(notification.params)
-
-			if (requestId === undefined) {
-				return
-			}
-
-			const clientRequestKeyValue = clientRequestKey(clientId, requestId)
-			const agentRequestId = this.clientRequestToAgentId.get(clientRequestKeyValue)
-
-			if (agentRequestId !== undefined) {
-				await this.sendAgentMessage(cancelRequestNotification(agentRequestId, notification.params))
-				return
-			}
-
-			const stateId = this.clientAgentRequestLookup.get(clientRequestKeyValue)
-			const state = stateId ? this.pendingAgentRequests.get(stateId) : undefined
-
-			if (state) {
-				await this.sendAgentMessage(cancelRequestNotification(state.agentRequestId, notification.params))
-			}
-
-			return
-		}
-
-		await this.sendAgentMessage(notification)
-	}
-
-	private async receiveAgentRequest(request: JsonRpcRequest) {
-		const stateId = `agent-request:${this.nextRequestStateId++}`
-		const state: PendingAgentRequest = {
-			stateId,
-			agentRequestId: request.id,
-			request,
-			deliveredClientId: undefined,
-			deliveredClientRequestId: undefined,
-			settled: false,
-		}
-		this.pendingAgentRequests.set(stateId, state)
-		this.agentRequestStateByAgentId.set(idKey(request.id), stateId)
-		await this.deliverAgentRequest(state)
-	}
-
-	private async receiveAgentResponse(response: JsonRpcResponse) {
-		const pending = this.pendingAgentResponses.get(idKey(response.id))
-
-		if (!pending) {
-			return
-		}
-
-		this.pendingAgentResponses.delete(idKey(response.id))
-
-		if (this.initializeAgentRequestId !== undefined && idEquals(this.initializeAgentRequestId, response.id)) {
-			this.initializeAgentRequestId = undefined
-		}
-
-		if (pending.kind === 'initialize') {
-			const payload = responsePayload(response)
-			this.cachedInitializeResponse = payload
-
-			for (const waiter of pending.waiters) {
-				await this.sendResponsePayload(waiter.clientId, waiter.clientRequestId, payload)
-			}
-
-			return
-		}
-
-		this.clientRequestToAgentId.delete(clientRequestKey(pending.clientId, pending.clientRequestId))
-
-		if (pending.kind === 'client') {
-			if (pending.method === METHOD_SESSION_NEW && 'result' in response) {
-				this.mergeSessionCache(sessionNewCacheParams(pending.params, response.result))
-			}
-
-			await this.sendToClient(pending.clientId, responseWithId(response, pending.clientRequestId))
-			return
-		}
-
-		if (pending.kind === 'prompt') {
-			await this.sendToClient(pending.clientId, responseWithId(response, pending.clientRequestId))
-
-			if (this.activePromptTurn && idEquals(this.activePromptTurn.agentPromptRequestId, response.id)) {
-				await this.finishActivePromptTurn()
-			}
-
-			return
-		}
-
-		const setupResponse = normalizePromptSetupResponse(responseWithId(response, pending.clientRequestId), pending.originalMethod, pending.sessionId)
-
-		if (this.activePromptTurn) {
-			this.activePromptTurn.deferredSetupResponses.push({
-				clientId: pending.clientId,
-				response: setupResponse,
-			})
-			return
-		}
-
-		await this.sendToClient(pending.clientId, setupResponse)
-	}
-
-	private async receiveAgentNotification(notification: JsonRpcNotification) {
-		if (notification.method === METHOD_CANCEL_REQUEST) {
-			const requestId = requestIdFromParams(notification.params)
-
-			if (requestId === undefined) {
-				return
-			}
-
-			const stateId = this.agentRequestStateByAgentId.get(idKey(requestId))
-			const state = stateId ? this.pendingAgentRequests.get(stateId) : undefined
-
-			if (!state || state.deliveredClientId === undefined || state.deliveredClientRequestId === undefined) {
-				return
-			}
-
-			await this.sendToClient(state.deliveredClientId, cancelRequestNotification(state.deliveredClientRequestId, notification.params))
-			return
-		}
-
-		await this.sendToCurrentClient(notification)
-	}
-
-	private async finishActivePromptTurn() {
-		const activePromptTurn = this.activePromptTurn
-
-		if (!activePromptTurn) {
-			return
-		}
-
-		this.activePromptTurn = undefined
-
-		for (const deferredResponse of activePromptTurn.deferredSetupResponses) {
-			await this.sendToClient(deferredResponse.clientId, deferredResponse.response)
-		}
-	}
-
-	private async flushPendingAgentRequests() {
-		for (const state of this.pendingAgentRequests.values()) {
-			await this.deliverAgentRequest(state)
-		}
-	}
-
-	private async deliverAgentRequest(state: PendingAgentRequest) {
-		if (state.settled || !this.client) {
-			return
-		}
-
-		if (state.deliveredClientId === this.client.id) {
-			return
-		}
-
-		this.clearDeliveredAgentRequest(state)
-
-		const clientRequestId = this.nextProxyRequestId('agent')
-		state.deliveredClientId = this.client.id
-		state.deliveredClientRequestId = clientRequestId
-		this.clientAgentRequestLookup.set(clientRequestKey(this.client.id, clientRequestId), state.stateId)
-		await this.sendToClient(this.client.id, requestWithId(state.request, clientRequestId))
-	}
-
-	private clearDeliveredAgentRequest(state: PendingAgentRequest) {
-		if (state.deliveredClientId !== undefined && state.deliveredClientRequestId !== undefined) {
-			this.clientAgentRequestLookup.delete(clientRequestKey(state.deliveredClientId, state.deliveredClientRequestId))
-		}
-
-		state.deliveredClientId = undefined
-		state.deliveredClientRequestId = undefined
-	}
-
-	private clearAgentRequestState(state: PendingAgentRequest) {
-		this.clearDeliveredAgentRequest(state)
-		this.pendingAgentRequests.delete(state.stateId)
-		this.agentRequestStateByAgentId.delete(idKey(state.agentRequestId))
-	}
-
-	private mergeSessionCache(params: unknown) {
-		if (!isRecord(params)) {
-			return
-		}
-
-		const base: Record<string, unknown> = this.cachedSessionLoad ? { ...this.cachedSessionLoad } : {}
-		const merged = { ...base, ...params }
-		const cwd = typeof merged.cwd === 'string' ? merged.cwd : undefined
-		const sessionId = typeof merged.sessionId === 'string' ? merged.sessionId : undefined
-		const mcpServers = Array.isArray(merged.mcpServers) ? merged.mcpServers : undefined
-
-		if (!cwd || !sessionId || !mcpServers) {
-			return
-		}
-
-		this.cachedSessionLoad = {
-			...merged,
-			cwd,
-			mcpServers,
-			sessionId,
-		}
-	}
-
-	private async sendResponsePayload(clientId: number, requestId: JsonRpcId, payload: JsonRpcPayload) {
-		if ('result' in payload) {
-			await this.sendToClient(clientId, makeResultResponse(requestId, payload.result))
-			return
-		}
-
-		await this.sendToClient(clientId, makeResponseWithError(requestId, payload.error))
-	}
-
-	private async sendToCurrentClient(message: JsonRpcMessage) {
-		if (!this.client) {
-			return false
-		}
-
-		return this.sendToClient(this.client.id, message)
-	}
-
-	private async sendToClient(clientId: number, message: JsonRpcMessage) {
-		const client = this.client
-
-		if (!client || client.id !== clientId) {
-			return false
-		}
-
-		try {
-			await client.sendMessage(message)
-			return true
-		} catch {
-			this.removeClient(clientId)
-			return false
-		}
-	}
-
-	private isCurrentClient(clientId: number) {
-		return this.client?.id === clientId
-	}
-
-	private nextProxyRequestId(prefix: string) {
-		return `acp-to-ws:${prefix}:${this.nextMessageId++}`
-	}
-}
-
-async function handleClientSocketMessage(proxy: AcpRecoveringProxy, clientId: number, socket: WebSocket, data: RawData) {
-	const text = rawDataToString(data)
-	let parsed: unknown
-
-	try {
-		parsed = JSON.parse(text)
-	} catch {
-		await sendSocketMessage(socket, makeErrorResponse(null, RequestError.parseError()))
-		return
-	}
-
-	if (!isJsonRpcMessage(parsed)) {
-		await sendSocketMessage(socket, makeErrorResponse(extractResponseId(parsed), RequestError.invalidRequest(parsed)))
-		return
-	}
-
-	await proxy.receiveClientMessage(clientId, parsed)
-}
-
-function queuedSender<T>(send: (message: T) => Promise<void>) {
-	let queue = Promise.resolve()
-
-	return (message: T) => {
-		const next = queue.then(() => send(message))
-		queue = next.catch(() => undefined)
-		return next
-	}
-}
-
 function rawDataToString(data: RawData) {
 	if (Array.isArray(data)) {
 		return Buffer.concat(data).toString('utf8')
@@ -609,7 +99,7 @@ function rawDataToString(data: RawData) {
 	return String(data)
 }
 
-function sendSocketMessage(socket: WebSocket, message: JsonRpcMessage) {
+function sendSocketMessage(socket: WebSocket, message: AnyMessage) {
 	return new Promise<void>((resolve, reject) => {
 		if (socket.readyState !== WebSocket.OPEN) {
 			reject(new Error('WebSocket is not open'))
@@ -668,7 +158,7 @@ function sessionNewCacheParams(params: unknown, result: unknown) {
 	}
 }
 
-function normalizePromptSetupResponse(response: JsonRpcResponse, originalMethod: SessionSetupMethod, sessionId: string) {
+function normalizePromptSetupResponse(response: AnyResponse, originalMethod: SessionSetupMethod, sessionId: string) {
 	if ('error' in response || originalMethod !== METHOD_SESSION_NEW) {
 		return response
 	}
@@ -683,11 +173,11 @@ function makeRequest(id: JsonRpcId, method: string, params: unknown) {
 		id,
 		method,
 		params,
-	} satisfies JsonRpcRequest
+	} satisfies AnyRequest
 }
 
-function requestWithId(request: JsonRpcRequest, id: JsonRpcId) {
-	const nextRequest: JsonRpcRequest = {
+function requestWithId(request: AnyRequest, id: JsonRpcId) {
+	const nextRequest: AnyRequest = {
 		jsonrpc: '2.0',
 		id,
 		method: request.method,
@@ -700,7 +190,7 @@ function requestWithId(request: JsonRpcRequest, id: JsonRpcId) {
 	return nextRequest
 }
 
-function responseWithId(response: JsonRpcResponse, id: JsonRpcId) {
+function responseWithId(response: AnyResponse, id: JsonRpcId) {
 	if ('result' in response) {
 		return makeResultResponse(id, response.result)
 	}
@@ -708,7 +198,7 @@ function responseWithId(response: JsonRpcResponse, id: JsonRpcId) {
 	return makeResponseWithError(id, response.error)
 }
 
-function makeResultResponse(id: JsonRpcId, result: unknown): JsonRpcResponse {
+function makeResultResponse(id: JsonRpcId, result: unknown): AnyResponse {
 	return {
 		jsonrpc: '2.0',
 		id,
@@ -716,7 +206,7 @@ function makeResultResponse(id: JsonRpcId, result: unknown): JsonRpcResponse {
 	}
 }
 
-function makeResponseWithError(id: JsonRpcId, error: ErrorResponse): JsonRpcResponse {
+function makeResponseWithError(id: JsonRpcId, error: ErrorResponse): AnyResponse {
 	return {
 		jsonrpc: '2.0',
 		id,
@@ -728,7 +218,7 @@ function makeErrorResponse(id: JsonRpcId, error: RequestError | ErrorResponse) {
 	return makeResponseWithError(id, error instanceof RequestError ? error.toErrorResponse() : error)
 }
 
-function responsePayload(response: JsonRpcResponse): JsonRpcPayload {
+function responsePayload(response: AnyResponse): JsonRpcPayload {
 	if ('result' in response) {
 		return { result: response.result }
 	}
@@ -743,7 +233,7 @@ function cancelRequestNotification(requestId: JsonRpcId, originalParams: unknown
 		jsonrpc: '2.0',
 		method: METHOD_CANCEL_REQUEST,
 		params,
-	} satisfies JsonRpcNotification
+	} satisfies AnyNotification
 }
 
 function requestIdFromParams(params: unknown) {
@@ -763,15 +253,15 @@ function stringProperty(value: unknown, key: string) {
 	return typeof property === 'string' ? property : undefined
 }
 
-function isJsonRpcMessage(value: unknown): value is JsonRpcMessage {
+function isJsonRpcMessage(value: unknown): value is AnyMessage {
 	return isRequestMessage(value) || isResponseMessage(value) || isNotificationMessage(value)
 }
 
-function isRequestMessage(value: unknown): value is JsonRpcRequest {
+function isRequestMessage(value: unknown): value is AnyRequest {
 	return isRecord(value) && value.jsonrpc === '2.0' && typeof value.method === 'string' && 'id' in value && isJsonRpcId(value.id)
 }
 
-function isResponseMessage(value: unknown): value is JsonRpcResponse {
+function isResponseMessage(value: unknown): value is AnyResponse {
 	if (!isRecord(value) || value.jsonrpc !== '2.0' || !('id' in value) || !isJsonRpcId(value.id) || 'method' in value) {
 		return false
 	}
@@ -781,7 +271,7 @@ function isResponseMessage(value: unknown): value is JsonRpcResponse {
 	return hasResult !== hasError && (!hasError || isJsonRpcError(value.error))
 }
 
-function isNotificationMessage(value: unknown): value is JsonRpcNotification {
+function isNotificationMessage(value: unknown): value is AnyNotification {
 	return isRecord(value) && value.jsonrpc === '2.0' && typeof value.method === 'string' && !('id' in value)
 }
 
@@ -858,7 +348,7 @@ Args:
 }
 
 const stdioAgent = spawn(command, args, {
-	stdio: ['pipe', 'pipe', 'inherit'],
+	stdio: ['overlapped', 'overlapped', 'inherit'],
 })
 
 const wsServer = new WebSocketServer({
@@ -871,40 +361,6 @@ function gracefulStop() {
 	stdioAgent.kill()
 	wsServer.close()
 }
-
-const agentStream = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
-const agentReader = agentStream.readable.getReader()
-const agentWriter = agentStream.writable.getWriter()
-const sendAgentMessage = queuedSender<JsonRpcMessage>(message => agentWriter.write(message as AnyMessage))
-const proxy = new AcpRecoveringProxy({ sendAgentMessage })
-const webSocketServerListening = waitForWebSocketServer(wsServer)
-
-
-wsServer.on('connection', socket => {
-	const sendMessage = queuedSender<JsonRpcMessage>(message => sendSocketMessage(socket, message))
-	const clientId = proxy.addClient(sendMessage, () => {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-			socket.close(1000, 'Replaced by a newer ACP client')
-		}
-	})
-
-	socket.on('message', data => {
-		void handleClientSocketMessage(proxy, clientId, socket, data).catch(error => {
-			console.error('ACP client message failed:', error)
-			proxy.removeClient(clientId)
-
-			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-				socket.close()
-			}
-		})
-	})
-	socket.on('close', () => {
-		proxy.removeClient(clientId)
-	})
-	socket.on('error', () => {
-		proxy.removeClient(clientId)
-	})
-})
 
 stdioAgent.on('error', error => {
 	console.error('Failed to start ACP agent:', error)
@@ -924,29 +380,530 @@ stdioAgent.on('exit', (code, signal) => {
 	gracefulStop()
 })
 
-void (async () => {
-	try {
-		for (; ;) {
-			const { done, value } = await agentReader.read()
+const { readable, writable } = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
+const agentWriter = writable.getWriter()
+const webSocketServerListening = waitForWebSocketServer(wsServer)
 
-			if (done) {
-				break
-			}
+let activePromptTurn: ActivePromptTurn | undefined
+let cachedInitializeResponse: JsonRpcPayload | undefined
+let cachedSessionLoad: CachedLoadParams | undefined
+let connectedClient: ConnectedClient | undefined
+let initializeAgentRequestId: JsonRpcId | undefined
+let nextClientId = 1
+let nextMessageId = 1
+let nextRequestStateId = 1
 
-			if (isJsonRpcMessage(value)) {
-				await proxy.receiveAgentMessage(value)
-			} else {
-				console.error('Ignoring invalid ACP agent message:', value)
-			}
-		}
-	} catch (error) {
-		console.error('ACP agent stream failed:', error)
-		process.exitCode = 1
-	} finally {
-		agentReader.releaseLock()
-		gracefulStop()
+const agentRequestStateByAgentId = new Map<string, string>()
+const clientAgentRequestLookup = new Map<string, string>()
+const clientRequestToAgentId = new Map<string, JsonRpcId>()
+const pendingAgentRequests = new Map<string, PendingAgentRequest>()
+const pendingAgentResponses = new Map<string, PendingAgentResponse>()
+
+function sendAgentMessage(message: AnyMessage) {
+	return agentWriter.write(message as AnyMessage)
+}
+
+function addClient(sendMessage: (message: AnyMessage) => Promise<void>, close: () => void) {
+	const previousClient = connectedClient
+
+	if (previousClient) {
+		removeClient(previousClient.id)
+		previousClient.close()
 	}
-})()
+
+	const clientId = nextClientId++
+	connectedClient = { id: clientId, close, sendMessage }
+	void flushPendingAgentRequests()
+	return clientId
+}
+
+function removeClient(clientId: number) {
+	if (connectedClient?.id === clientId) {
+		connectedClient = undefined
+	}
+
+	for (const key of Array.from(clientRequestToAgentId.keys())) {
+		if (key.startsWith(`${clientId}:`)) {
+			clientRequestToAgentId.delete(key)
+		}
+	}
+
+	for (const key of Array.from(clientAgentRequestLookup.keys())) {
+		if (key.startsWith(`${clientId}:`)) {
+			clientAgentRequestLookup.delete(key)
+		}
+	}
+
+	for (const pending of pendingAgentResponses.values()) {
+		if (pending.kind === 'initialize') {
+			pending.waiters = pending.waiters.filter(waiter => waiter.clientId !== clientId)
+		}
+	}
+
+	if (activePromptTurn) {
+		activePromptTurn.deferredSetupResponses = activePromptTurn.deferredSetupResponses.filter(response => response.clientId !== clientId)
+	}
+
+	for (const state of pendingAgentRequests.values()) {
+		if (state.deliveredClientId === clientId) {
+			clearDeliveredAgentRequest(state)
+		}
+	}
+}
+
+async function receiveClientMessage(clientId: number, message: AnyMessage) {
+	if (isRequestMessage(message)) {
+		await receiveClientRequest(clientId, message)
+		return
+	}
+
+	if (isResponseMessage(message)) {
+		await receiveClientResponse(clientId, message)
+		return
+	}
+
+	await receiveClientNotification(clientId, message)
+}
+
+async function receiveAgentMessage(message: AnyMessage) {
+	if (isRequestMessage(message)) {
+		await receiveAgentRequest(message)
+		return
+	}
+
+	if (isResponseMessage(message)) {
+		await receiveAgentResponse(message)
+		return
+	}
+
+	await receiveAgentNotification(message)
+}
+
+async function receiveClientRequest(clientId: number, request: AnyRequest) {
+	if (!isCurrentClient(clientId)) {
+		return
+	}
+
+	if (request.method === METHOD_INITIALIZE) {
+		await receiveInitializeRequest(clientId, request)
+		return
+	}
+
+	if (activePromptTurn) {
+		if (request.method === METHOD_SESSION_PROMPT) {
+			await sendToClient(clientId, makeErrorResponse(request.id, new RequestError(ERROR_CODE_CONFLICT, 'A prompt turn is already running.', { activeSessionId: activePromptTurn.sessionId ?? null })))
+			return
+		}
+
+		if (isSessionSetupMethod(request.method)) {
+			await receiveSessionSetupDuringPrompt(clientId, request, request.method)
+			return
+		}
+	}
+
+	if (request.method === METHOD_SESSION_LOAD || request.method === METHOD_SESSION_RESUME) {
+		mergeSessionCache(request.params)
+	}
+
+	if (request.method === METHOD_SESSION_PROMPT) {
+		await forwardPromptRequest(clientId, request)
+		return
+	}
+
+	await forwardClientRequest(clientId, request)
+}
+
+async function receiveInitializeRequest(clientId: number, request: AnyRequest) {
+	if (cachedInitializeResponse) {
+		await sendResponsePayload(clientId, request.id, cachedInitializeResponse)
+		return
+	}
+
+	if (initializeAgentRequestId !== undefined) {
+		const pending = pendingAgentResponses.get(idKey(initializeAgentRequestId))
+
+		if (pending?.kind === 'initialize') {
+			pending.waiters.push({ clientId, clientRequestId: request.id })
+			return
+		}
+	}
+
+	const agentRequestId = nextProxyRequestId('initialize')
+	initializeAgentRequestId = agentRequestId
+	pendingAgentResponses.set(idKey(agentRequestId), {
+		kind: 'initialize',
+		waiters: [{ clientId, clientRequestId: request.id }],
+	})
+	await sendAgentMessage(requestWithId(request, agentRequestId))
+}
+
+async function receiveSessionSetupDuringPrompt(clientId: number, request: AnyRequest, originalMethod: SessionSetupMethod) {
+	const cachedLoadParams = cachedSessionLoad
+
+	if (!cachedLoadParams) {
+		await sendToClient(clientId, makeErrorResponse(request.id, RequestError.internalError(undefined, 'No cached session/load parameters are available for prompt-turn recovery.')))
+		return
+	}
+
+	const agentRequestId = nextProxyRequestId('session-load')
+	pendingAgentResponses.set(idKey(agentRequestId), {
+		kind: 'promptSetup',
+		clientId,
+		clientRequestId: request.id,
+		originalMethod,
+		sessionId: cachedLoadParams.sessionId,
+	})
+	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
+	await sendAgentMessage(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
+}
+
+async function forwardPromptRequest(clientId: number, request: AnyRequest) {
+	const agentRequestId = nextProxyRequestId('prompt')
+	pendingAgentResponses.set(idKey(agentRequestId), {
+		kind: 'prompt',
+		clientId,
+		clientRequestId: request.id,
+	})
+	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
+	activePromptTurn = {
+		agentPromptRequestId: agentRequestId,
+		sessionId: stringProperty(request.params, 'sessionId') ?? cachedSessionLoad?.sessionId,
+		deferredSetupResponses: [],
+	}
+	await sendAgentMessage(requestWithId(request, agentRequestId))
+}
+
+async function forwardClientRequest(clientId: number, request: AnyRequest) {
+	const agentRequestId = nextProxyRequestId('client')
+	pendingAgentResponses.set(idKey(agentRequestId), {
+		kind: 'client',
+		clientId,
+		clientRequestId: request.id,
+		method: request.method,
+		params: request.params,
+	})
+	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
+	await sendAgentMessage(requestWithId(request, agentRequestId))
+}
+
+async function receiveClientResponse(clientId: number, response: AnyResponse) {
+	const stateId = clientAgentRequestLookup.get(clientRequestKey(clientId, response.id))
+
+	if (!stateId) {
+		return
+	}
+
+	const state = pendingAgentRequests.get(stateId)
+
+	if (!state || state.settled) {
+		return
+	}
+
+	state.settled = true
+	clearAgentRequestState(state)
+	await sendAgentMessage(responseWithId(response, state.agentRequestId))
+}
+
+async function receiveClientNotification(clientId: number, notification: AnyNotification) {
+	if (!isCurrentClient(clientId)) {
+		return
+	}
+
+	if (notification.method === METHOD_CANCEL_REQUEST) {
+		const requestId = requestIdFromParams(notification.params)
+
+		if (requestId === undefined) {
+			return
+		}
+
+		const clientRequestKeyValue = clientRequestKey(clientId, requestId)
+		const agentRequestId = clientRequestToAgentId.get(clientRequestKeyValue)
+
+		if (agentRequestId !== undefined) {
+			await sendAgentMessage(cancelRequestNotification(agentRequestId, notification.params))
+			return
+		}
+
+		const stateId = clientAgentRequestLookup.get(clientRequestKeyValue)
+		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
+
+		if (state) {
+			await sendAgentMessage(cancelRequestNotification(state.agentRequestId, notification.params))
+		}
+
+		return
+	}
+
+	await sendAgentMessage(notification)
+}
+
+async function receiveAgentRequest(request: AnyRequest) {
+	const stateId = `agent-request:${nextRequestStateId++}`
+	const state: PendingAgentRequest = {
+		stateId,
+		agentRequestId: request.id,
+		request,
+		deliveredClientId: undefined,
+		deliveredClientRequestId: undefined,
+		settled: false,
+	}
+	pendingAgentRequests.set(stateId, state)
+	agentRequestStateByAgentId.set(idKey(request.id), stateId)
+	await deliverAgentRequest(state)
+}
+
+async function receiveAgentResponse(response: AnyResponse) {
+	const pending = pendingAgentResponses.get(idKey(response.id))
+
+	if (!pending) {
+		return
+	}
+
+	pendingAgentResponses.delete(idKey(response.id))
+
+	if (initializeAgentRequestId !== undefined && idEquals(initializeAgentRequestId, response.id)) {
+		initializeAgentRequestId = undefined
+	}
+
+	if (pending.kind === 'initialize') {
+		const payload = responsePayload(response)
+		cachedInitializeResponse = payload
+
+		for (const waiter of pending.waiters) {
+			await sendResponsePayload(waiter.clientId, waiter.clientRequestId, payload)
+		}
+
+		return
+	}
+
+	clientRequestToAgentId.delete(clientRequestKey(pending.clientId, pending.clientRequestId))
+
+	if (pending.kind === 'client') {
+		if (pending.method === METHOD_SESSION_NEW && 'result' in response) {
+			mergeSessionCache(sessionNewCacheParams(pending.params, response.result))
+		}
+
+		await sendToClient(pending.clientId, responseWithId(response, pending.clientRequestId))
+		return
+	}
+
+	if (pending.kind === 'prompt') {
+		await sendToClient(pending.clientId, responseWithId(response, pending.clientRequestId))
+
+		if (activePromptTurn && idEquals(activePromptTurn.agentPromptRequestId, response.id)) {
+			await finishActivePromptTurn()
+		}
+
+		return
+	}
+
+	const setupResponse = normalizePromptSetupResponse(responseWithId(response, pending.clientRequestId), pending.originalMethod, pending.sessionId)
+
+	if (activePromptTurn) {
+		activePromptTurn.deferredSetupResponses.push({
+			clientId: pending.clientId,
+			response: setupResponse,
+		})
+		return
+	}
+
+	await sendToClient(pending.clientId, setupResponse)
+}
+
+async function receiveAgentNotification(notification: AnyNotification) {
+	if (notification.method === METHOD_CANCEL_REQUEST) {
+		const requestId = requestIdFromParams(notification.params)
+
+		if (requestId === undefined) {
+			return
+		}
+
+		const stateId = agentRequestStateByAgentId.get(idKey(requestId))
+		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
+
+		if (!state || state.deliveredClientId === undefined || state.deliveredClientRequestId === undefined) {
+			return
+		}
+
+		await sendToClient(state.deliveredClientId, cancelRequestNotification(state.deliveredClientRequestId, notification.params))
+		return
+	}
+
+	await sendToCurrentClient(notification)
+}
+
+async function finishActivePromptTurn() {
+	const promptTurn = activePromptTurn
+
+	if (!promptTurn) {
+		return
+	}
+
+	activePromptTurn = undefined
+
+	for (const deferredResponse of promptTurn.deferredSetupResponses) {
+		await sendToClient(deferredResponse.clientId, deferredResponse.response)
+	}
+}
+
+async function flushPendingAgentRequests() {
+	for (const state of pendingAgentRequests.values()) {
+		await deliverAgentRequest(state)
+	}
+}
+
+async function deliverAgentRequest(state: PendingAgentRequest) {
+	if (state.settled || !connectedClient) {
+		return
+	}
+
+	if (state.deliveredClientId === connectedClient.id) {
+		return
+	}
+
+	clearDeliveredAgentRequest(state)
+
+	const clientRequestId = nextProxyRequestId('agent')
+	state.deliveredClientId = connectedClient.id
+	state.deliveredClientRequestId = clientRequestId
+	clientAgentRequestLookup.set(clientRequestKey(connectedClient.id, clientRequestId), state.stateId)
+	await sendToClient(connectedClient.id, requestWithId(state.request, clientRequestId))
+}
+
+function clearDeliveredAgentRequest(state: PendingAgentRequest) {
+	if (state.deliveredClientId !== undefined && state.deliveredClientRequestId !== undefined) {
+		clientAgentRequestLookup.delete(clientRequestKey(state.deliveredClientId, state.deliveredClientRequestId))
+	}
+
+	state.deliveredClientId = undefined
+	state.deliveredClientRequestId = undefined
+}
+
+function clearAgentRequestState(state: PendingAgentRequest) {
+	clearDeliveredAgentRequest(state)
+	pendingAgentRequests.delete(state.stateId)
+	agentRequestStateByAgentId.delete(idKey(state.agentRequestId))
+}
+
+function mergeSessionCache(params: unknown) {
+	if (!isRecord(params)) {
+		return
+	}
+
+	const base: Record<string, unknown> = cachedSessionLoad ? { ...cachedSessionLoad } : {}
+	const merged = { ...base, ...params }
+	const cwd = typeof merged.cwd === 'string' ? merged.cwd : undefined
+	const sessionId = typeof merged.sessionId === 'string' ? merged.sessionId : undefined
+	const mcpServers = Array.isArray(merged.mcpServers) ? merged.mcpServers : undefined
+
+	if (!cwd || !sessionId || !mcpServers) {
+		return
+	}
+
+	cachedSessionLoad = {
+		...merged,
+		cwd,
+		mcpServers,
+		sessionId,
+	}
+}
+
+async function sendResponsePayload(clientId: number, requestId: JsonRpcId, payload: JsonRpcPayload) {
+	if ('result' in payload) {
+		await sendToClient(clientId, makeResultResponse(requestId, payload.result))
+		return
+	}
+
+	await sendToClient(clientId, makeResponseWithError(requestId, payload.error))
+}
+
+async function sendToCurrentClient(message: AnyMessage) {
+	if (!connectedClient) {
+		return false
+	}
+
+	return sendToClient(connectedClient.id, message)
+}
+
+async function sendToClient(clientId: number, message: AnyMessage) {
+	const targetClient = connectedClient
+
+	if (!targetClient || targetClient.id !== clientId) {
+		return false
+	}
+
+	try {
+		await targetClient.sendMessage(message)
+		return true
+	} catch {
+		removeClient(clientId)
+		return false
+	}
+}
+
+function isCurrentClient(clientId: number) {
+	return connectedClient?.id === clientId
+}
+
+function nextProxyRequestId(prefix: string) {
+	return `acp-to-ws:${prefix}:${nextMessageId++}`
+}
+
+async function handleClientSocketMessage(clientId: number, socket: WebSocket, data: RawData) {
+	const text = rawDataToString(data)
+	let parsed: unknown
+
+	try {
+		parsed = JSON.parse(text)
+	} catch {
+		await sendSocketMessage(socket, makeErrorResponse(null, RequestError.parseError()))
+		return
+	}
+
+	if (!isJsonRpcMessage(parsed)) {
+		await sendSocketMessage(socket, makeErrorResponse(extractResponseId(parsed), RequestError.invalidRequest(parsed)))
+		return
+	}
+
+	await receiveClientMessage(clientId, parsed)
+}
+
+wsServer.on('connection', socket => {
+	const clientId = addClient(
+		message => sendSocketMessage(socket, message),
+		() => {
+			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+				socket.close(1000, 'Replaced by a newer ACP client')
+			}
+		},
+	)
+
+	socket.on('message', data => {
+		void handleClientSocketMessage(clientId, socket, data).catch(error => {
+			console.error('ACP client message failed:', error)
+			removeClient(clientId)
+
+			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+				socket.close()
+			}
+		})
+	})
+	socket.on('close', () => {
+		removeClient(clientId)
+	})
+	socket.on('error', () => {
+		removeClient(clientId)
+	})
+})
+
+async function readStdout() {
+	for await (const message of readable) {
+		await receiveAgentMessage(message)
+	}
+	gracefulStop()
+}
+
+void readStdout()
 
 try {
 	await webSocketServerListening
