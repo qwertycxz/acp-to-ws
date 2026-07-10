@@ -1,41 +1,27 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
-import { createServer, type Server } from 'node:http'
 import { join } from 'node:path/posix'
 import { exit } from 'node:process'
 import { Readable, Writable } from 'node:stream'
 import { parseArgs } from 'node:util'
-import { ndJsonStream, type AnyMessage } from '@agentclientprotocol/sdk'
+import {
+	methods,
+	ndJsonStream,
+	RequestError,
+	type AnyMessage,
+	type AnyNotification,
+	type AnyRequest,
+	type AnyResponse,
+	type ErrorResponse,
+	type JsonRpcId,
+} from '@agentclientprotocol/sdk'
 import { WebSocket, WebSocketServer, type RawData } from 'ws'
 
-type JsonRpcId = string | number | null
-
-type JsonRpcError = {
-	code: number
-	message: string
-	data?: unknown
-}
-
-type JsonRpcRequest = {
-	jsonrpc: '2.0'
-	id: JsonRpcId
-	method: string
-	params?: unknown
-}
-
-type JsonRpcResponse = {
-	jsonrpc: '2.0'
-	id: JsonRpcId
-} & ({ result: unknown } | { error: JsonRpcError })
-
-type JsonRpcNotification = {
-	jsonrpc: '2.0'
-	method: string
-	params?: unknown
-}
-
-type JsonRpcMessage = JsonRpcRequest | JsonRpcResponse | JsonRpcNotification
-type JsonRpcPayload = { result: unknown } | { error: JsonRpcError }
+type JsonRpcRequest = AnyRequest
+type JsonRpcResponse = AnyResponse
+type JsonRpcNotification = AnyNotification
+type JsonRpcMessage = AnyMessage
+type JsonRpcPayload = { result: unknown } | { error: ErrorResponse }
 
 type ConnectedClient = {
 	id: number
@@ -101,19 +87,16 @@ type ActivePromptTurn = {
 	deferredSetupResponses: DeferredPromptSetupResponse[]
 }
 
-const METHOD_CANCEL_REQUEST = '$/cancel_request'
-const METHOD_INITIALIZE = 'initialize'
-const METHOD_SESSION_LOAD = 'session/load'
-const METHOD_SESSION_NEW = 'session/new'
-const METHOD_SESSION_PROMPT = 'session/prompt'
-const METHOD_SESSION_RESUME = 'session/resume'
+const METHOD_CANCEL_REQUEST = methods.protocol.cancelRequest
+const METHOD_INITIALIZE = methods.agent.initialize
+const METHOD_SESSION_LOAD = methods.agent.session.load
+const METHOD_SESSION_NEW = methods.agent.session.new
+const METHOD_SESSION_PROMPT = methods.agent.session.prompt
+const METHOD_SESSION_RESUME = methods.agent.session.resume
 
 type SessionSetupMethod = typeof METHOD_SESSION_LOAD | typeof METHOD_SESSION_NEW | typeof METHOD_SESSION_RESUME
 
 const ERROR_CODE_CONFLICT = -32099
-const ERROR_CODE_INTERNAL = -32603
-const ERROR_CODE_INVALID_REQUEST = -32600
-const ERROR_CODE_PARSE = -32700
 
 class AcpRecoveringProxy {
 	private activePromptTurn: ActivePromptTurn | undefined
@@ -223,7 +206,7 @@ class AcpRecoveringProxy {
 
 		if (this.activePromptTurn) {
 			if (request.method === METHOD_SESSION_PROMPT) {
-				await this.sendToClient(clientId, makeErrorResponse(request.id, ERROR_CODE_CONFLICT, 'A prompt turn is already running.', { activeSessionId: this.activePromptTurn.sessionId ?? null }))
+				await this.sendToClient(clientId, makeErrorResponse(request.id, new RequestError(ERROR_CODE_CONFLICT, 'A prompt turn is already running.', { activeSessionId: this.activePromptTurn.sessionId ?? null })))
 				return
 			}
 
@@ -273,7 +256,7 @@ class AcpRecoveringProxy {
 		const cachedLoadParams = this.cachedSessionLoad
 
 		if (!cachedLoadParams) {
-			await this.sendToClient(clientId, makeErrorResponse(request.id, ERROR_CODE_INTERNAL, 'No cached session/load parameters are available for prompt-turn recovery.'))
+			await this.sendToClient(clientId, makeErrorResponse(request.id, RequestError.internalError(undefined, 'No cached session/load parameters are available for prompt-turn recovery.')))
 			return
 		}
 
@@ -583,30 +566,18 @@ class AcpRecoveringProxy {
 }
 
 async function startProxy(args: string[], command: string, host: string, path: string, port: number) {
-	const agentProcess = spawn(command, args, {
-		shell: process.platform === 'win32',
+	const stdioAgent = spawn(command, args, {
 		stdio: ['pipe', 'pipe', 'inherit'],
 	})
-	const agentInput = Writable.toWeb(agentProcess.stdin) as WritableStream<Uint8Array>
-	const agentOutput = Readable.toWeb(agentProcess.stdout) as ReadableStream<Uint8Array>
-	const agentStream = ndJsonStream(agentInput, agentOutput)
+	const agentStream = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
 	const agentReader = agentStream.readable.getReader()
 	const agentWriter = agentStream.writable.getWriter()
 	const sendAgentMessage = queuedSender<JsonRpcMessage>(message => agentWriter.write(message as AnyMessage))
 	const proxy = new AcpRecoveringProxy({ sendAgentMessage })
-	const webSocketServer = new WebSocketServer({ noServer: true })
-	const httpServer = createServer((request, response) => {
-		if (!isMatchingPath(request.url, path)) {
-			response.writeHead(404, { 'Content-Type': 'text/plain' })
-			response.end('Not Found')
-			return
-		}
-
-		response.writeHead(426, { 'Content-Type': 'text/plain' })
-		response.end('Upgrade Required')
-	})
+	const webSocketServer = new WebSocketServer({ host, path, port })
+	const webSocketServerListening = waitForWebSocketServer(webSocketServer)
 	let stopPromise: Promise<void> | undefined
-	let resolveClosed: () => void = () => {}
+	let resolveClosed: () => void = () => { }
 	const closed = new Promise<void>(resolve => {
 		resolveClosed = resolve
 	})
@@ -617,11 +588,11 @@ async function startProxy(args: string[], command: string, host: string, path: s
 		}
 
 		stopPromise = (async () => {
-			if (killAgent && !agentProcess.killed) {
-				agentProcess.kill()
+			if (killAgent && !stdioAgent.killed) {
+				stdioAgent.kill()
 			}
 
-			await Promise.all([closeWebSocketServer(webSocketServer), closeHttpServer(httpServer)])
+			await closeWebSocketServer(webSocketServer)
 			try {
 				agentWriter.releaseLock()
 			} catch {
@@ -658,24 +629,13 @@ async function startProxy(args: string[], command: string, host: string, path: s
 		})
 	})
 
-	httpServer.on('upgrade', (request, socket, head) => {
-		if (!isMatchingPath(request.url, path)) {
-			socket.destroy()
-			return
-		}
-
-		webSocketServer.handleUpgrade(request, socket, head, webSocket => {
-			webSocketServer.emit('connection', webSocket, request)
-		})
-	})
-
-	agentProcess.once('error', error => {
+	stdioAgent.once('error', error => {
 		console.error('Failed to start ACP agent:', error)
 		process.exitCode = 1
 		void stop(false)
 	})
 
-	agentProcess.once('exit', (code, signal) => {
+	stdioAgent.once('exit', (code, signal) => {
 		if (typeof code === 'number' && code !== 0) {
 			process.exitCode = code
 		}
@@ -689,7 +649,7 @@ async function startProxy(args: string[], command: string, host: string, path: s
 
 	void (async () => {
 		try {
-			for (;;) {
+			for (; ;) {
 				const { done, value } = await agentReader.read()
 
 				if (done) {
@@ -712,7 +672,7 @@ async function startProxy(args: string[], command: string, host: string, path: s
 	})()
 
 	try {
-		await listen(httpServer, port, host)
+		await webSocketServerListening
 		console.error(`ACP WebSocket proxy listening at ws://${host}:${port}${path}`)
 		await closed
 	} catch (error) {
@@ -728,12 +688,12 @@ async function handleClientSocketMessage(proxy: AcpRecoveringProxy, clientId: nu
 	try {
 		parsed = JSON.parse(text)
 	} catch {
-		await sendSocketMessage(socket, makeErrorResponse(null, ERROR_CODE_PARSE, 'Parse error'))
+		await sendSocketMessage(socket, makeErrorResponse(null, RequestError.parseError()))
 		return
 	}
 
 	if (!isJsonRpcMessage(parsed)) {
-		await sendSocketMessage(socket, makeErrorResponse(extractResponseId(parsed), ERROR_CODE_INVALID_REQUEST, 'Invalid request'))
+		await sendSocketMessage(socket, makeErrorResponse(extractResponseId(parsed), RequestError.invalidRequest(parsed)))
 		return
 	}
 
@@ -784,29 +744,20 @@ function sendSocketMessage(socket: WebSocket, message: JsonRpcMessage) {
 	})
 }
 
-function listen(server: Server, port: number, host: string) {
+function waitForWebSocketServer(server: WebSocketServer) {
 	return new Promise<void>((resolve, reject) => {
 		const onError = (error: Error) => {
+			server.off('listening', onListening)
 			reject(error)
 		}
 
-		server.once('error', onError)
-		server.listen(port, host, () => {
+		const onListening = () => {
 			server.off('error', onError)
 			resolve()
-		})
-	})
-}
+		}
 
-function closeHttpServer(server: Server) {
-	if (!server.listening) {
-		return Promise.resolve()
-	}
-
-	return new Promise<void>(resolve => {
-		server.close(() => {
-			resolve()
-		})
+		server.once('error', onError)
+		server.once('listening', onListening)
 	})
 }
 
@@ -822,10 +773,6 @@ function closeWebSocketServer(server: WebSocketServer) {
 			resolve()
 		})
 	})
-}
-
-function isMatchingPath(url: string | undefined, expectedPath: string) {
-	return new URL(url ?? '/', 'http://127.0.0.1').pathname === expectedPath
 }
 
 function isSessionSetupMethod(method: string): method is SessionSetupMethod {
@@ -900,7 +847,7 @@ function makeResultResponse(id: JsonRpcId, result: unknown): JsonRpcResponse {
 	}
 }
 
-function makeResponseWithError(id: JsonRpcId, error: JsonRpcError): JsonRpcResponse {
+function makeResponseWithError(id: JsonRpcId, error: ErrorResponse): JsonRpcResponse {
 	return {
 		jsonrpc: '2.0',
 		id,
@@ -908,18 +855,8 @@ function makeResponseWithError(id: JsonRpcId, error: JsonRpcError): JsonRpcRespo
 	}
 }
 
-function makeErrorResponse(id: JsonRpcId, code: number, message: string, data?: unknown) {
-	return makeResponseWithError(id, makeError(code, message, data))
-}
-
-function makeError(code: number, message: string, data?: unknown) {
-	const error: JsonRpcError = { code, message }
-
-	if (data !== undefined) {
-		error.data = data
-	}
-
-	return error
+function makeErrorResponse(id: JsonRpcId, error: RequestError | ErrorResponse) {
+	return makeResponseWithError(id, error instanceof RequestError ? error.toErrorResponse() : error)
 }
 
 function responsePayload(response: JsonRpcResponse): JsonRpcPayload {
@@ -979,7 +916,7 @@ function isNotificationMessage(value: unknown): value is JsonRpcNotification {
 	return isRecord(value) && value.jsonrpc === '2.0' && typeof value.method === 'string' && !('id' in value)
 }
 
-function isJsonRpcError(value: unknown): value is JsonRpcError {
+function isJsonRpcError(value: unknown): value is ErrorResponse {
 	return isRecord(value) && typeof value.code === 'number' && Number.isInteger(value.code) && typeof value.message === 'string'
 }
 
