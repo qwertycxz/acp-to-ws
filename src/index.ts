@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
 import { join } from 'node:path/posix'
-import { exit } from 'node:process'
 import { Readable, Writable } from 'node:stream'
 import { parseArgs } from 'node:util'
 import {
@@ -565,122 +564,6 @@ class AcpRecoveringProxy {
 	}
 }
 
-async function startProxy(args: string[], command: string, host: string, path: string, port: number) {
-	const stdioAgent = spawn(command, args, {
-		stdio: ['pipe', 'pipe', 'inherit'],
-	})
-	const agentStream = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
-	const agentReader = agentStream.readable.getReader()
-	const agentWriter = agentStream.writable.getWriter()
-	const sendAgentMessage = queuedSender<JsonRpcMessage>(message => agentWriter.write(message as AnyMessage))
-	const proxy = new AcpRecoveringProxy({ sendAgentMessage })
-	const webSocketServer = new WebSocketServer({ host, path, port })
-	const webSocketServerListening = waitForWebSocketServer(webSocketServer)
-	let stopPromise: Promise<void> | undefined
-	let resolveClosed: () => void = () => { }
-	const closed = new Promise<void>(resolve => {
-		resolveClosed = resolve
-	})
-
-	const stop = (killAgent: boolean) => {
-		if (stopPromise) {
-			return stopPromise
-		}
-
-		stopPromise = (async () => {
-			if (killAgent && !stdioAgent.killed) {
-				stdioAgent.kill()
-			}
-
-			await closeWebSocketServer(webSocketServer)
-			try {
-				agentWriter.releaseLock()
-			} catch {
-				// The process is already stopping; pending writes may have closed the writer.
-			}
-			resolveClosed()
-		})()
-		return stopPromise
-	}
-
-	webSocketServer.on('connection', socket => {
-		const sendMessage = queuedSender<JsonRpcMessage>(message => sendSocketMessage(socket, message))
-		const clientId = proxy.addClient(sendMessage, () => {
-			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-				socket.close(1000, 'Replaced by a newer ACP client')
-			}
-		})
-
-		socket.on('message', data => {
-			void handleClientSocketMessage(proxy, clientId, socket, data).catch(error => {
-				console.error('ACP client message failed:', error)
-				proxy.removeClient(clientId)
-
-				if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-					socket.close()
-				}
-			})
-		})
-		socket.on('close', () => {
-			proxy.removeClient(clientId)
-		})
-		socket.on('error', () => {
-			proxy.removeClient(clientId)
-		})
-	})
-
-	stdioAgent.once('error', error => {
-		console.error('Failed to start ACP agent:', error)
-		process.exitCode = 1
-		void stop(false)
-	})
-
-	stdioAgent.once('exit', (code, signal) => {
-		if (typeof code === 'number' && code !== 0) {
-			process.exitCode = code
-		}
-
-		if (signal) {
-			console.error(`ACP agent exited after signal ${signal}`)
-		}
-
-		void stop(false)
-	})
-
-	void (async () => {
-		try {
-			for (; ;) {
-				const { done, value } = await agentReader.read()
-
-				if (done) {
-					break
-				}
-
-				if (isJsonRpcMessage(value)) {
-					await proxy.receiveAgentMessage(value)
-				} else {
-					console.error('Ignoring invalid ACP agent message:', value)
-				}
-			}
-		} catch (error) {
-			console.error('ACP agent stream failed:', error)
-			process.exitCode = 1
-		} finally {
-			agentReader.releaseLock()
-			void stop(true)
-		}
-	})()
-
-	try {
-		await webSocketServerListening
-		console.error(`ACP WebSocket proxy listening at ws://${host}:${port}${path}`)
-		await closed
-	} catch (error) {
-		await stop(true)
-		throw error
-	}
-}
-
 async function handleClientSocketMessage(proxy: AcpRecoveringProxy, clientId: number, socket: WebSocket, data: RawData) {
 	const text = rawDataToString(data)
 	let parsed: unknown
@@ -758,20 +641,6 @@ function waitForWebSocketServer(server: WebSocketServer) {
 
 		server.once('error', onError)
 		server.once('listening', onListening)
-	})
-}
-
-function closeWebSocketServer(server: WebSocketServer) {
-	for (const socket of server.clients) {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-			socket.close()
-		}
-	}
-
-	return new Promise<void>(resolve => {
-		server.close(() => {
-			resolve()
-		})
 	})
 }
 
@@ -985,7 +854,104 @@ Args:
 	<host>  Defaults to ${DEFAULT_HOST}
 	<path>  Defaults to ${DEFAULT_PATH}
 	<port>  Defaults to ${DEFAULT_PORT}`)
-	exit(1)
+	process.exit(1)
 }
 
-await startProxy(args, command, host, join('/', path), parseInt(port))
+const stdioAgent = spawn(command, args, {
+	stdio: ['pipe', 'pipe', 'inherit'],
+})
+
+const wsServer = new WebSocketServer({
+	host,
+	path: join('/', path),
+	port: parseInt(port),
+})
+
+function gracefulStop() {
+	stdioAgent.kill()
+	wsServer.close()
+}
+
+const agentStream = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
+const agentReader = agentStream.readable.getReader()
+const agentWriter = agentStream.writable.getWriter()
+const sendAgentMessage = queuedSender<JsonRpcMessage>(message => agentWriter.write(message as AnyMessage))
+const proxy = new AcpRecoveringProxy({ sendAgentMessage })
+const webSocketServerListening = waitForWebSocketServer(wsServer)
+
+
+wsServer.on('connection', socket => {
+	const sendMessage = queuedSender<JsonRpcMessage>(message => sendSocketMessage(socket, message))
+	const clientId = proxy.addClient(sendMessage, () => {
+		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+			socket.close(1000, 'Replaced by a newer ACP client')
+		}
+	})
+
+	socket.on('message', data => {
+		void handleClientSocketMessage(proxy, clientId, socket, data).catch(error => {
+			console.error('ACP client message failed:', error)
+			proxy.removeClient(clientId)
+
+			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+				socket.close()
+			}
+		})
+	})
+	socket.on('close', () => {
+		proxy.removeClient(clientId)
+	})
+	socket.on('error', () => {
+		proxy.removeClient(clientId)
+	})
+})
+
+stdioAgent.on('error', error => {
+	console.error('Failed to start ACP agent:', error)
+	process.exitCode = 1
+	gracefulStop()
+})
+
+stdioAgent.on('exit', (code, signal) => {
+	if (typeof code === 'number' && code !== 0) {
+		process.exitCode = code
+	}
+
+	if (signal) {
+		console.error(`ACP agent exited after signal ${signal}`)
+	}
+
+	gracefulStop()
+})
+
+void (async () => {
+	try {
+		for (; ;) {
+			const { done, value } = await agentReader.read()
+
+			if (done) {
+				break
+			}
+
+			if (isJsonRpcMessage(value)) {
+				await proxy.receiveAgentMessage(value)
+			} else {
+				console.error('Ignoring invalid ACP agent message:', value)
+			}
+		}
+	} catch (error) {
+		console.error('ACP agent stream failed:', error)
+		process.exitCode = 1
+	} finally {
+		agentReader.releaseLock()
+		gracefulStop()
+	}
+})()
+
+try {
+	await webSocketServerListening
+	console.error(`ACP WebSocket proxy listening at ws://${host}:${port}${path}`)
+} catch (error) {
+	gracefulStop()
+	throw error
+}
