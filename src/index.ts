@@ -8,23 +8,17 @@ import { WebSocket, WebSocketServer, type RawData } from 'ws'
 
 type JsonRpcPayload = { result: unknown } | { error: ErrorResponse }
 
-type ConnectedClient = {
-	id: number
-	close: () => void
-	sendMessage: (message: AnyMessage) => Promise<void>
-}
-
 type InitializePendingResponse = {
 	kind: 'initialize'
 	waiters: Array<{
-		clientId: number
+		client: WebSocket
 		clientRequestId: JsonRpcId
 	}>
 }
 
 type ClientPendingResponse = {
 	kind: 'client'
-	clientId: number
+	client: WebSocket
 	clientRequestId: JsonRpcId
 	method: string
 	params: unknown
@@ -32,13 +26,13 @@ type ClientPendingResponse = {
 
 type PromptPendingResponse = {
 	kind: 'prompt'
-	clientId: number
+	client: WebSocket
 	clientRequestId: JsonRpcId
 }
 
 type PromptSetupPendingResponse = {
 	kind: 'promptSetup'
-	clientId: number
+	client: WebSocket
 	clientRequestId: JsonRpcId
 	originalMethod: SessionSetupMethod
 	sessionId: string
@@ -50,7 +44,7 @@ type PendingAgentRequest = {
 	stateId: string
 	agentRequestId: JsonRpcId
 	request: AnyRequest
-	deliveredClientId: number | undefined
+	deliveredClient: WebSocket | undefined
 	deliveredClientRequestId: JsonRpcId | undefined
 	settled: boolean
 }
@@ -62,7 +56,7 @@ type CachedLoadParams = Record<string, unknown> & {
 }
 
 type DeferredPromptSetupResponse = {
-	clientId: number
+	client: WebSocket
 	response: AnyResponse
 }
 
@@ -278,10 +272,6 @@ function idKey(id: JsonRpcId) {
 	return `${typeof id}:${JSON.stringify(id)}`
 }
 
-function clientRequestKey(clientId: number, requestId: JsonRpcId) {
-	return `${clientId}:${idKey(requestId)}`
-}
-
 function idEquals(left: JsonRpcId, right: JsonRpcId) {
 	return idKey(left) === idKey(right)
 }
@@ -330,16 +320,16 @@ Args:
 	process.exit(1)
 }
 
-const stdioAgent = spawn(command, args, {
+const STDIO_AGENT = spawn(command, args, {
 	stdio: ['overlapped', 'overlapped', 'inherit'],
 })
 
-stdioAgent.on('error', error => {
+STDIO_AGENT.on('error', error => {
 	console.error('Failed to start ACP agent:', error)
 	process.exit(1)
 })
 
-stdioAgent.on('exit', (code, signal) => {
+STDIO_AGENT.on('exit', (code, signal) => {
 	if (signal) {
 		console.error(`ACP agent exited after signal ${signal}`)
 	}
@@ -350,7 +340,7 @@ stdioAgent.on('exit', (code, signal) => {
 	process.exit(code)
 })
 
-const { readable, writable } = ndJsonStream(Writable.toWeb(stdioAgent.stdin), Readable.toWeb(stdioAgent.stdout))
+const { readable, writable } = ndJsonStream(Writable.toWeb(STDIO_AGENT.stdin), Readable.toWeb(STDIO_AGENT.stdout))
 
 async function readStdout() {
 	for await (const message of readable) {
@@ -360,15 +350,15 @@ async function readStdout() {
 }
 void readStdout()
 
-const agentStdin = writable.getWriter()
+const AGENT_STDIN = writable.getWriter()
 
-const wsServer = new WebSocketServer({
+const WS_SERVER = new WebSocketServer({
 	host,
 	path: join('/', path),
 	port: parseInt(port),
 })
 
-wsServer.on('error', error => {
+WS_SERVER.on('error', error => {
 	console.error('ACP WebSocket server error:', error)
 	process.exit(1)
 })
@@ -376,78 +366,76 @@ wsServer.on('error', error => {
 let activePromptTurn: ActivePromptTurn | undefined
 let cachedInitializeResponse: JsonRpcPayload | undefined
 let cachedSessionLoad: CachedLoadParams | undefined
-let connectedClient: ConnectedClient | undefined
+let ws_client: WebSocket | undefined
 let initializeAgentRequestId: JsonRpcId | undefined
-let nextClientId = 1
 let nextMessageId = 1
 let nextRequestStateId = 1
 
 const agentRequestStateByAgentId = new Map<string, string>()
-const clientAgentRequestLookup = new Map<string, string>()
-const clientRequestToAgentId = new Map<string, JsonRpcId>()
+const clientAgentRequestLookup = new Map<WebSocket, Map<string, string>>()
+const clientRequestToAgentId = new Map<WebSocket, Map<string, JsonRpcId>>()
 const pendingAgentRequests = new Map<string, PendingAgentRequest>()
 const pendingAgentResponses = new Map<string, PendingAgentResponse>()
 
-function addClient(sendMessage: (message: AnyMessage) => Promise<void>, close: () => void) {
-	const previousClient = connectedClient
+function clientRequestToAgentMap(client: WebSocket) {
+	let requests = clientRequestToAgentId.get(client)
 
-	if (previousClient) {
-		removeClient(previousClient.id)
-		previousClient.close()
+	if (!requests) {
+		requests = new Map()
+		clientRequestToAgentId.set(client, requests)
 	}
 
-	const clientId = nextClientId++
-	connectedClient = { id: clientId, close, sendMessage }
-	void flushPendingAgentRequests()
-	return clientId
+	return requests
 }
 
-function removeClient(clientId: number) {
-	if (connectedClient?.id === clientId) {
-		connectedClient = undefined
+function clientAgentRequestLookupMap(client: WebSocket) {
+	let requests = clientAgentRequestLookup.get(client)
+
+	if (!requests) {
+		requests = new Map()
+		clientAgentRequestLookup.set(client, requests)
 	}
 
-	for (const key of Array.from(clientRequestToAgentId.keys())) {
-		if (key.startsWith(`${clientId}:`)) {
-			clientRequestToAgentId.delete(key)
-		}
+	return requests
+}
+
+function removeClient(client: WebSocket) {
+	if (ws_client === client) {
+		ws_client = undefined
 	}
 
-	for (const key of Array.from(clientAgentRequestLookup.keys())) {
-		if (key.startsWith(`${clientId}:`)) {
-			clientAgentRequestLookup.delete(key)
-		}
-	}
+	clientRequestToAgentId.delete(client)
+	clientAgentRequestLookup.delete(client)
 
 	for (const pending of pendingAgentResponses.values()) {
 		if (pending.kind === 'initialize') {
-			pending.waiters = pending.waiters.filter(waiter => waiter.clientId !== clientId)
+			pending.waiters = pending.waiters.filter(waiter => waiter.client !== client)
 		}
 	}
 
 	if (activePromptTurn) {
-		activePromptTurn.deferredSetupResponses = activePromptTurn.deferredSetupResponses.filter(response => response.clientId !== clientId)
+		activePromptTurn.deferredSetupResponses = activePromptTurn.deferredSetupResponses.filter(response => response.client !== client)
 	}
 
 	for (const state of pendingAgentRequests.values()) {
-		if (state.deliveredClientId === clientId) {
+		if (state.deliveredClient === client) {
 			clearDeliveredAgentRequest(state)
 		}
 	}
 }
 
-async function receiveClientMessage(clientId: number, message: AnyMessage) {
+async function receiveClientMessage(client: WebSocket, message: AnyMessage) {
 	if (isRequestMessage(message)) {
-		await receiveClientRequest(clientId, message)
+		await receiveClientRequest(client, message)
 		return
 	}
 
 	if (isResponseMessage(message)) {
-		await receiveClientResponse(clientId, message)
+		await receiveClientResponse(client, message)
 		return
 	}
 
-	await receiveClientNotification(clientId, message)
+	await receiveClientNotification(client, message)
 }
 
 async function receiveAgentMessage(message: AnyMessage) {
@@ -464,24 +452,24 @@ async function receiveAgentMessage(message: AnyMessage) {
 	await receiveAgentNotification(message)
 }
 
-async function receiveClientRequest(clientId: number, request: AnyRequest) {
-	if (!isCurrentClient(clientId)) {
+async function receiveClientRequest(client: WebSocket, request: AnyRequest) {
+	if (client != ws_client) {
 		return
 	}
 
 	if (request.method === METHOD_INITIALIZE) {
-		await receiveInitializeRequest(clientId, request)
+		await receiveInitializeRequest(client, request)
 		return
 	}
 
 	if (activePromptTurn) {
 		if (request.method === METHOD_SESSION_PROMPT) {
-			await sendToClient(clientId, makeErrorResponse(request.id, new RequestError(ERROR_CODE_CONFLICT, 'A prompt turn is already running.', { activeSessionId: activePromptTurn.sessionId ?? null })))
+			await sendToClient(client, makeErrorResponse(request.id, new RequestError(ERROR_CODE_CONFLICT, 'A prompt turn is already running.', { activeSessionId: activePromptTurn.sessionId ?? null })))
 			return
 		}
 
 		if (isSessionSetupMethod(request.method)) {
-			await receiveSessionSetupDuringPrompt(clientId, request, request.method)
+			await receiveSessionSetupDuringPrompt(client, request, request.method)
 			return
 		}
 	}
@@ -491,16 +479,16 @@ async function receiveClientRequest(clientId: number, request: AnyRequest) {
 	}
 
 	if (request.method === METHOD_SESSION_PROMPT) {
-		await forwardPromptRequest(clientId, request)
+		await forwardPromptRequest(client, request)
 		return
 	}
 
-	await forwardClientRequest(clientId, request)
+	await forwardClientRequest(client, request)
 }
 
-async function receiveInitializeRequest(clientId: number, request: AnyRequest) {
+async function receiveInitializeRequest(client: WebSocket, request: AnyRequest) {
 	if (cachedInitializeResponse) {
-		await sendResponsePayload(clientId, request.id, cachedInitializeResponse)
+		await sendResponsePayload(client, request.id, cachedInitializeResponse)
 		return
 	}
 
@@ -508,7 +496,7 @@ async function receiveInitializeRequest(clientId: number, request: AnyRequest) {
 		const pending = pendingAgentResponses.get(idKey(initializeAgentRequestId))
 
 		if (pending?.kind === 'initialize') {
-			pending.waiters.push({ clientId, clientRequestId: request.id })
+			pending.waiters.push({ client, clientRequestId: request.id })
 			return
 		}
 	}
@@ -517,62 +505,62 @@ async function receiveInitializeRequest(clientId: number, request: AnyRequest) {
 	initializeAgentRequestId = agentRequestId
 	pendingAgentResponses.set(idKey(agentRequestId), {
 		kind: 'initialize',
-		waiters: [{ clientId, clientRequestId: request.id }],
+		waiters: [{ client, clientRequestId: request.id }],
 	})
-	await agentStdin.write(requestWithId(request, agentRequestId))
+	await AGENT_STDIN.write(requestWithId(request, agentRequestId))
 }
 
-async function receiveSessionSetupDuringPrompt(clientId: number, request: AnyRequest, originalMethod: SessionSetupMethod) {
+async function receiveSessionSetupDuringPrompt(client: WebSocket, request: AnyRequest, originalMethod: SessionSetupMethod) {
 	const cachedLoadParams = cachedSessionLoad
 
 	if (!cachedLoadParams) {
-		await sendToClient(clientId, makeErrorResponse(request.id, RequestError.internalError(undefined, 'No cached session/load parameters are available for prompt-turn recovery.')))
+		await sendToClient(client, makeErrorResponse(request.id, RequestError.internalError(undefined, 'No cached session/load parameters are available for prompt-turn recovery.')))
 		return
 	}
 
 	const agentRequestId = nextProxyRequestId('session-load')
 	pendingAgentResponses.set(idKey(agentRequestId), {
 		kind: 'promptSetup',
-		clientId,
+		client,
 		clientRequestId: request.id,
 		originalMethod,
 		sessionId: cachedLoadParams.sessionId,
 	})
-	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-	await agentStdin.write(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
+	clientRequestToAgentMap(client).set(idKey(request.id), agentRequestId)
+	await AGENT_STDIN.write(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
 }
 
-async function forwardPromptRequest(clientId: number, request: AnyRequest) {
+async function forwardPromptRequest(client: WebSocket, request: AnyRequest) {
 	const agentRequestId = nextProxyRequestId('prompt')
 	pendingAgentResponses.set(idKey(agentRequestId), {
 		kind: 'prompt',
-		clientId,
+		client,
 		clientRequestId: request.id,
 	})
-	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
+	clientRequestToAgentMap(client).set(idKey(request.id), agentRequestId)
 	activePromptTurn = {
 		agentPromptRequestId: agentRequestId,
 		sessionId: stringProperty(request.params, 'sessionId') ?? cachedSessionLoad?.sessionId,
 		deferredSetupResponses: [],
 	}
-	await agentStdin.write(requestWithId(request, agentRequestId))
+	await AGENT_STDIN.write(requestWithId(request, agentRequestId))
 }
 
-async function forwardClientRequest(clientId: number, request: AnyRequest) {
+async function forwardClientRequest(client: WebSocket, request: AnyRequest) {
 	const agentRequestId = nextProxyRequestId('client')
 	pendingAgentResponses.set(idKey(agentRequestId), {
 		kind: 'client',
-		clientId,
+		client,
 		clientRequestId: request.id,
 		method: request.method,
 		params: request.params,
 	})
-	clientRequestToAgentId.set(clientRequestKey(clientId, request.id), agentRequestId)
-	await agentStdin.write(requestWithId(request, agentRequestId))
+	clientRequestToAgentMap(client).set(idKey(request.id), agentRequestId)
+	await AGENT_STDIN.write(requestWithId(request, agentRequestId))
 }
 
-async function receiveClientResponse(clientId: number, response: AnyResponse) {
-	const stateId = clientAgentRequestLookup.get(clientRequestKey(clientId, response.id))
+async function receiveClientResponse(client: WebSocket, response: AnyResponse) {
+	const stateId = clientAgentRequestLookup.get(client)?.get(idKey(response.id))
 
 	if (!stateId) {
 		return
@@ -586,11 +574,11 @@ async function receiveClientResponse(clientId: number, response: AnyResponse) {
 
 	state.settled = true
 	clearAgentRequestState(state)
-	await agentStdin.write(responseWithId(response, state.agentRequestId))
+	await AGENT_STDIN.write(responseWithId(response, state.agentRequestId))
 }
 
-async function receiveClientNotification(clientId: number, notification: AnyNotification) {
-	if (!isCurrentClient(clientId)) {
+async function receiveClientNotification(client: WebSocket, notification: AnyNotification) {
+	if (client != ws_client) {
 		return
 	}
 
@@ -601,25 +589,25 @@ async function receiveClientNotification(clientId: number, notification: AnyNoti
 			return
 		}
 
-		const clientRequestKeyValue = clientRequestKey(clientId, requestId)
-		const agentRequestId = clientRequestToAgentId.get(clientRequestKeyValue)
+		const requestKey = idKey(requestId)
+		const agentRequestId = clientRequestToAgentId.get(client)?.get(requestKey)
 
 		if (agentRequestId !== undefined) {
-			await agentStdin.write(cancelRequestNotification(agentRequestId, notification.params))
+			await AGENT_STDIN.write(cancelRequestNotification(agentRequestId, notification.params))
 			return
 		}
 
-		const stateId = clientAgentRequestLookup.get(clientRequestKeyValue)
+		const stateId = clientAgentRequestLookup.get(client)?.get(requestKey)
 		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
 
 		if (state) {
-			await agentStdin.write(cancelRequestNotification(state.agentRequestId, notification.params))
+			await AGENT_STDIN.write(cancelRequestNotification(state.agentRequestId, notification.params))
 		}
 
 		return
 	}
 
-	await agentStdin.write(notification)
+	await AGENT_STDIN.write(notification)
 }
 
 async function receiveAgentRequest(request: AnyRequest) {
@@ -628,7 +616,7 @@ async function receiveAgentRequest(request: AnyRequest) {
 		stateId,
 		agentRequestId: request.id,
 		request,
-		deliveredClientId: undefined,
+		deliveredClient: undefined,
 		deliveredClientRequestId: undefined,
 		settled: false,
 	}
@@ -655,25 +643,25 @@ async function receiveAgentResponse(response: AnyResponse) {
 		cachedInitializeResponse = payload
 
 		for (const waiter of pending.waiters) {
-			await sendResponsePayload(waiter.clientId, waiter.clientRequestId, payload)
+			await sendResponsePayload(waiter.client, waiter.clientRequestId, payload)
 		}
 
 		return
 	}
 
-	clientRequestToAgentId.delete(clientRequestKey(pending.clientId, pending.clientRequestId))
+	clientRequestToAgentId.get(pending.client)?.delete(idKey(pending.clientRequestId))
 
 	if (pending.kind === 'client') {
 		if (pending.method === METHOD_SESSION_NEW && 'result' in response) {
 			mergeSessionCache(sessionNewCacheParams(pending.params, response.result))
 		}
 
-		await sendToClient(pending.clientId, responseWithId(response, pending.clientRequestId))
+		await sendToClient(pending.client, responseWithId(response, pending.clientRequestId))
 		return
 	}
 
 	if (pending.kind === 'prompt') {
-		await sendToClient(pending.clientId, responseWithId(response, pending.clientRequestId))
+		await sendToClient(pending.client, responseWithId(response, pending.clientRequestId))
 
 		if (activePromptTurn && idEquals(activePromptTurn.agentPromptRequestId, response.id)) {
 			await finishActivePromptTurn()
@@ -686,13 +674,13 @@ async function receiveAgentResponse(response: AnyResponse) {
 
 	if (activePromptTurn) {
 		activePromptTurn.deferredSetupResponses.push({
-			clientId: pending.clientId,
+			client: pending.client,
 			response: setupResponse,
 		})
 		return
 	}
 
-	await sendToClient(pending.clientId, setupResponse)
+	await sendToClient(pending.client, setupResponse)
 }
 
 async function receiveAgentNotification(notification: AnyNotification) {
@@ -706,11 +694,11 @@ async function receiveAgentNotification(notification: AnyNotification) {
 		const stateId = agentRequestStateByAgentId.get(idKey(requestId))
 		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
 
-		if (!state || state.deliveredClientId === undefined || state.deliveredClientRequestId === undefined) {
+		if (!state || state.deliveredClient === undefined || state.deliveredClientRequestId === undefined) {
 			return
 		}
 
-		await sendToClient(state.deliveredClientId, cancelRequestNotification(state.deliveredClientRequestId, notification.params))
+		await sendToClient(state.deliveredClient, cancelRequestNotification(state.deliveredClientRequestId, notification.params))
 		return
 	}
 
@@ -727,7 +715,7 @@ async function finishActivePromptTurn() {
 	activePromptTurn = undefined
 
 	for (const deferredResponse of promptTurn.deferredSetupResponses) {
-		await sendToClient(deferredResponse.clientId, deferredResponse.response)
+		await sendToClient(deferredResponse.client, deferredResponse.response)
 	}
 }
 
@@ -738,29 +726,29 @@ async function flushPendingAgentRequests() {
 }
 
 async function deliverAgentRequest(state: PendingAgentRequest) {
-	if (state.settled || !connectedClient) {
+	if (state.settled || !ws_client) {
 		return
 	}
 
-	if (state.deliveredClientId === connectedClient.id) {
+	if (state.deliveredClient === ws_client) {
 		return
 	}
 
 	clearDeliveredAgentRequest(state)
 
 	const clientRequestId = nextProxyRequestId('agent')
-	state.deliveredClientId = connectedClient.id
+	state.deliveredClient = ws_client
 	state.deliveredClientRequestId = clientRequestId
-	clientAgentRequestLookup.set(clientRequestKey(connectedClient.id, clientRequestId), state.stateId)
-	await sendToClient(connectedClient.id, requestWithId(state.request, clientRequestId))
+	clientAgentRequestLookupMap(ws_client).set(idKey(clientRequestId), state.stateId)
+	await sendToClient(ws_client, requestWithId(state.request, clientRequestId))
 }
 
 function clearDeliveredAgentRequest(state: PendingAgentRequest) {
-	if (state.deliveredClientId !== undefined && state.deliveredClientRequestId !== undefined) {
-		clientAgentRequestLookup.delete(clientRequestKey(state.deliveredClientId, state.deliveredClientRequestId))
+	if (state.deliveredClient !== undefined && state.deliveredClientRequestId !== undefined) {
+		clientAgentRequestLookup.get(state.deliveredClient)?.delete(idKey(state.deliveredClientRequestId))
 	}
 
-	state.deliveredClientId = undefined
+	state.deliveredClient = undefined
 	state.deliveredClientRequestId = undefined
 }
 
@@ -793,91 +781,84 @@ function mergeSessionCache(params: unknown) {
 	}
 }
 
-async function sendResponsePayload(clientId: number, requestId: JsonRpcId, payload: JsonRpcPayload) {
+async function sendResponsePayload(client: WebSocket, requestId: JsonRpcId, payload: JsonRpcPayload) {
 	if ('result' in payload) {
-		await sendToClient(clientId, makeResultResponse(requestId, payload.result))
+		await sendToClient(client, makeResultResponse(requestId, payload.result))
 		return
 	}
 
-	await sendToClient(clientId, makeResponseWithError(requestId, payload.error))
+	await sendToClient(client, makeResponseWithError(requestId, payload.error))
 }
 
 async function sendToCurrentClient(message: AnyMessage) {
-	if (!connectedClient) {
+	if (!ws_client) {
 		return false
 	}
 
-	return sendToClient(connectedClient.id, message)
+	return sendToClient(ws_client, message)
 }
 
-async function sendToClient(clientId: number, message: AnyMessage) {
-	const targetClient = connectedClient
-
-	if (!targetClient || targetClient.id !== clientId) {
+async function sendToClient(client: WebSocket, message: AnyMessage) {
+	if (client != ws_client) {
 		return false
 	}
 
 	try {
-		await targetClient.sendMessage(message)
+		await sendSocketMessage(client, message)
 		return true
 	} catch {
-		removeClient(clientId)
+		removeClient(client)
 		return false
 	}
-}
-
-function isCurrentClient(clientId: number) {
-	return connectedClient?.id === clientId
 }
 
 function nextProxyRequestId(prefix: string) {
 	return `acp-to-ws:${prefix}:${nextMessageId++}`
 }
 
-async function handleClientSocketMessage(clientId: number, socket: WebSocket, data: RawData) {
+async function handleClientSocketMessage(client: WebSocket, data: RawData) {
 	const text = rawDataToString(data)
 	let parsed: unknown
 
 	try {
 		parsed = JSON.parse(text)
 	} catch {
-		await sendSocketMessage(socket, makeErrorResponse(null, RequestError.parseError()))
+		await sendSocketMessage(client, makeErrorResponse(null, RequestError.parseError()))
 		return
 	}
 
 	if (!isJsonRpcMessage(parsed)) {
-		await sendSocketMessage(socket, makeErrorResponse(extractResponseId(parsed), RequestError.invalidRequest(parsed)))
+		await sendSocketMessage(client, makeErrorResponse(extractResponseId(parsed), RequestError.invalidRequest(parsed)))
 		return
 	}
 
-	await receiveClientMessage(clientId, parsed)
+	await receiveClientMessage(client, parsed)
 }
 
-wsServer.on('connection', socket => {
-	const clientId = addClient(
-		message => sendSocketMessage(socket, message),
-		() => {
-			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-				socket.close(1000, 'Replaced by a newer ACP client')
-			}
-		},
-	)
+WS_SERVER.on('connection', client => {
+	if (ws_client) {
+		ws_client.close(1000, 'Replaced by a newer ACP client')
+		removeClient(ws_client)
+	}
 
-	socket.on('message', data => {
-		void handleClientSocketMessage(clientId, socket, data).catch(error => {
+	ws_client = client
+	void flushPendingAgentRequests()
+
+	client.on('message', data => {
+		void handleClientSocketMessage(client, data).catch(error => {
 			console.error('ACP client message failed:', error)
-			removeClient(clientId)
+			removeClient(client)
 
-			if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-				socket.close()
+			if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
+				client.close()
 			}
 		})
 	})
-	socket.on('close', () => {
-		removeClient(clientId)
+	client.on('close', () => {
+		removeClient(client)
 	})
-	socket.on('error', () => {
-		removeClient(clientId)
+	client.on('error', () => {
+		removeClient(client)
 	})
 })
 
