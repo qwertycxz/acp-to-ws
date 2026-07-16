@@ -41,7 +41,6 @@ type PromptSetupPendingResponse = {
 type PendingAgentResponse = InitializePendingResponse | ClientPendingResponse | PromptPendingResponse | PromptSetupPendingResponse
 
 type PendingAgentRequest = {
-	stateId: string
 	agentRequestId: JsonRpcId
 	request: AnyRequest
 	deliveredClient: WebSocket | undefined
@@ -76,6 +75,7 @@ const METHOD_SESSION_RESUME = methods.agent.session.resume
 type SessionSetupMethod = typeof METHOD_SESSION_LOAD | typeof METHOD_SESSION_NEW | typeof METHOD_SESSION_RESUME
 
 const ERROR_CODE_CONFLICT = -32099
+const ERROR_CODE_RECONNECT_REQUIRED = -32098
 
 function rawDataToString(data: RawData) {
 	if (Array.isArray(data)) {
@@ -369,9 +369,7 @@ let cachedSessionLoad: CachedLoadParams | undefined
 let ws_client: WebSocket | undefined
 let initializeAgentRequestId: JsonRpcId | undefined
 let nextMessageId = 1
-let nextRequestStateId = 1
 
-const agentRequestStateByAgentId = new Map<string, string>()
 const clientAgentRequestLookup = new Map<WebSocket, Map<string, string>>()
 const clientRequestToAgentId = new Map<WebSocket, Map<string, JsonRpcId>>()
 const pendingAgentRequests = new Map<string, PendingAgentRequest>()
@@ -454,6 +452,9 @@ async function receiveAgentMessage(message: AnyMessage) {
 
 async function receiveClientRequest(client: WebSocket, request: AnyRequest) {
 	if (client != ws_client) {
+		await sendSocketMessage(client, makeErrorResponse(request.id, new RequestError(ERROR_CODE_RECONNECT_REQUIRED, 'A new connection is required. Please refresh the page.'))).catch(() => {
+			removeClient(client)
+		})
 		return
 	}
 
@@ -560,13 +561,13 @@ async function forwardClientRequest(client: WebSocket, request: AnyRequest) {
 }
 
 async function receiveClientResponse(client: WebSocket, response: AnyResponse) {
-	const stateId = clientAgentRequestLookup.get(client)?.get(idKey(response.id))
+	const agentRequestKey = clientAgentRequestLookup.get(client)?.get(idKey(response.id))
 
-	if (!stateId) {
+	if (!agentRequestKey) {
 		return
 	}
 
-	const state = pendingAgentRequests.get(stateId)
+	const state = pendingAgentRequests.get(agentRequestKey)
 
 	if (!state || state.settled) {
 		return
@@ -597,8 +598,8 @@ async function receiveClientNotification(client: WebSocket, notification: AnyNot
 			return
 		}
 
-		const stateId = clientAgentRequestLookup.get(client)?.get(requestKey)
-		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
+		const agentRequestKey = clientAgentRequestLookup.get(client)?.get(requestKey)
+		const state = agentRequestKey ? pendingAgentRequests.get(agentRequestKey) : undefined
 
 		if (state) {
 			await AGENT_STDIN.write(cancelRequestNotification(state.agentRequestId, notification.params))
@@ -611,17 +612,14 @@ async function receiveClientNotification(client: WebSocket, notification: AnyNot
 }
 
 async function receiveAgentRequest(request: AnyRequest) {
-	const stateId = `agent-request:${nextRequestStateId++}`
 	const state: PendingAgentRequest = {
-		stateId,
 		agentRequestId: request.id,
 		request,
 		deliveredClient: undefined,
 		deliveredClientRequestId: undefined,
 		settled: false,
 	}
-	pendingAgentRequests.set(stateId, state)
-	agentRequestStateByAgentId.set(idKey(request.id), stateId)
+	pendingAgentRequests.set(idKey(request.id), state)
 	await deliverAgentRequest(state)
 }
 
@@ -691,8 +689,7 @@ async function receiveAgentNotification(notification: AnyNotification) {
 			return
 		}
 
-		const stateId = agentRequestStateByAgentId.get(idKey(requestId))
-		const state = stateId ? pendingAgentRequests.get(stateId) : undefined
+		const state = pendingAgentRequests.get(idKey(requestId))
 
 		if (!state || state.deliveredClient === undefined || state.deliveredClientRequestId === undefined) {
 			return
@@ -739,7 +736,7 @@ async function deliverAgentRequest(state: PendingAgentRequest) {
 	const clientRequestId = nextProxyRequestId('agent')
 	state.deliveredClient = ws_client
 	state.deliveredClientRequestId = clientRequestId
-	clientAgentRequestLookupMap(ws_client).set(idKey(clientRequestId), state.stateId)
+	clientAgentRequestLookupMap(ws_client).set(idKey(clientRequestId), idKey(state.agentRequestId))
 	await sendToClient(ws_client, requestWithId(state.request, clientRequestId))
 }
 
@@ -754,8 +751,7 @@ function clearDeliveredAgentRequest(state: PendingAgentRequest) {
 
 function clearAgentRequestState(state: PendingAgentRequest) {
 	clearDeliveredAgentRequest(state)
-	pendingAgentRequests.delete(state.stateId)
-	agentRequestStateByAgentId.delete(idKey(state.agentRequestId))
+	pendingAgentRequests.delete(idKey(state.agentRequestId))
 }
 
 function mergeSessionCache(params: unknown) {
@@ -837,7 +833,6 @@ async function handleClientSocketMessage(client: WebSocket, data: RawData) {
 
 WS_SERVER.on('connection', client => {
 	if (ws_client) {
-		ws_client.close(1000, 'Replaced by a newer ACP client')
 		removeClient(ws_client)
 	}
 
