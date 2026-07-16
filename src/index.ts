@@ -93,6 +93,10 @@ function rawDataToString(data: RawData) {
 	return String(data)
 }
 
+function logStdioMessage(stream: 'stdin' | 'stdout', message: AnyMessage) {
+	console.error(`[stdio-agent ${stream}] ${JSON.stringify(message)}`)
+}
+
 function sendSocketMessage(socket: WebSocket, message: AnyMessage) {
 	return new Promise<void>((resolve, reject) => {
 		if (socket.readyState !== WebSocket.OPEN) {
@@ -344,6 +348,7 @@ const { readable, writable } = ndJsonStream(Writable.toWeb(STDIO_AGENT.stdin), R
 
 async function readStdout() {
 	for await (const message of readable) {
+		logStdioMessage('stdout', message)
 		await receiveAgentMessage(message)
 	}
 	process.exit()
@@ -351,6 +356,11 @@ async function readStdout() {
 void readStdout()
 
 const AGENT_STDIN = writable.getWriter()
+
+async function writeAgentStdin(message: AnyMessage) {
+	logStdioMessage('stdin', message)
+	await AGENT_STDIN.write(message)
+}
 
 const WS_SERVER = new WebSocketServer({
 	host,
@@ -508,7 +518,7 @@ async function receiveInitializeRequest(client: WebSocket, request: AnyRequest) 
 		kind: 'initialize',
 		waiters: [{ client, clientRequestId: request.id }],
 	})
-	await AGENT_STDIN.write(requestWithId(request, agentRequestId))
+	await writeAgentStdin(requestWithId(request, agentRequestId))
 }
 
 async function receiveSessionSetupDuringPrompt(client: WebSocket, request: AnyRequest, originalMethod: SessionSetupMethod) {
@@ -528,7 +538,7 @@ async function receiveSessionSetupDuringPrompt(client: WebSocket, request: AnyRe
 		sessionId: cachedLoadParams.sessionId,
 	})
 	clientRequestToAgentMap(client).set(idKey(request.id), agentRequestId)
-	await AGENT_STDIN.write(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
+	await writeAgentStdin(makeRequest(agentRequestId, METHOD_SESSION_LOAD, cachedLoadRequest(cachedLoadParams)))
 }
 
 async function forwardPromptRequest(client: WebSocket, request: AnyRequest) {
@@ -544,7 +554,7 @@ async function forwardPromptRequest(client: WebSocket, request: AnyRequest) {
 		sessionId: stringProperty(request.params, 'sessionId') ?? cachedSessionLoad?.sessionId,
 		deferredSetupResponses: [],
 	}
-	await AGENT_STDIN.write(requestWithId(request, agentRequestId))
+	await writeAgentStdin(requestWithId(request, agentRequestId))
 }
 
 async function forwardClientRequest(client: WebSocket, request: AnyRequest) {
@@ -557,7 +567,7 @@ async function forwardClientRequest(client: WebSocket, request: AnyRequest) {
 		params: request.params,
 	})
 	clientRequestToAgentMap(client).set(idKey(request.id), agentRequestId)
-	await AGENT_STDIN.write(requestWithId(request, agentRequestId))
+	await writeAgentStdin(requestWithId(request, agentRequestId))
 }
 
 async function receiveClientResponse(client: WebSocket, response: AnyResponse) {
@@ -575,7 +585,7 @@ async function receiveClientResponse(client: WebSocket, response: AnyResponse) {
 
 	state.settled = true
 	clearAgentRequestState(state)
-	await AGENT_STDIN.write(responseWithId(response, state.agentRequestId))
+	await writeAgentStdin(responseWithId(response, state.agentRequestId))
 }
 
 async function receiveClientNotification(client: WebSocket, notification: AnyNotification) {
@@ -594,7 +604,7 @@ async function receiveClientNotification(client: WebSocket, notification: AnyNot
 		const agentRequestId = clientRequestToAgentId.get(client)?.get(requestKey)
 
 		if (agentRequestId !== undefined) {
-			await AGENT_STDIN.write(cancelRequestNotification(agentRequestId, notification.params))
+			await writeAgentStdin(cancelRequestNotification(agentRequestId, notification.params))
 			return
 		}
 
@@ -602,13 +612,13 @@ async function receiveClientNotification(client: WebSocket, notification: AnyNot
 		const state = agentRequestKey ? pendingAgentRequests.get(agentRequestKey) : undefined
 
 		if (state) {
-			await AGENT_STDIN.write(cancelRequestNotification(state.agentRequestId, notification.params))
+			await writeAgentStdin(cancelRequestNotification(state.agentRequestId, notification.params))
 		}
 
 		return
 	}
 
-	await AGENT_STDIN.write(notification)
+	await writeAgentStdin(notification)
 }
 
 async function receiveAgentRequest(request: AnyRequest) {
