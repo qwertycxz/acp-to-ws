@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { AGENT_METHODS, ndJsonStream, PROTOCOL_METHODS, RequestError, type AnyMessage, type AnyRequest, type AnyResponse, type JsonRpcId, type LoadSessionRequest, type NewSessionRequest, type SessionId } from '@agentclientprotocol/sdk'
 import { spawn } from 'node:child_process'
+import { constants } from 'node:os'
 import { Readable, Writable } from 'node:stream'
 import { parseArgs } from 'node:util'
-import { AGENT_METHODS, ndJsonStream, PROTOCOL_METHODS, RequestError, type AnyMessage, type AnyRequest, type AnyResponse, type LoadSessionRequest, type NewSessionRequest, type SessionId, type JsonRpcId } from '@agentclientprotocol/sdk'
 import { WebSocket, WebSocketServer } from 'ws'
 
 function messageClient(client: WebSocket, message: Omit<AnyMessage, 'jsonrpc'>) {
@@ -15,6 +16,11 @@ function messageClient(client: WebSocket, message: Omit<AnyMessage, 'jsonrpc'>) 
 }
 
 const AGENT2CLIENT_ID = new Map<WebSocket, Map<JsonRpcId, JsonRpcId>>()
+interface Agent2ClientRequest {
+	client?: WebSocket
+	id?: JsonRpcId
+	request: AnyRequest
+}
 let ws_client: WebSocket | undefined = undefined
 
 function requestClient(request: Agent2ClientRequest) {
@@ -59,7 +65,7 @@ const {
 	},
 })
 
-if (help || !(spawn_command && host && port)) {
+if (help || !spawn_command) {
 	console.error(`Usage:
 	acp-to-ws [--host <host>] [--port <port>] -- <stdio-agent-command> [args...]
 
@@ -70,7 +76,7 @@ Examples:
 Args:
 	<host>  Defaults to ${DEFAULT_HOST}
 	<port>  Defaults to ${DEFAULT_PORT}`)
-	process.exit(1)
+	process.exit(constants.errno.EINVAL)
 }
 
 const STDIO_AGENT = spawn(spawn_command, spawn_arguments, {
@@ -78,16 +84,13 @@ const STDIO_AGENT = spawn(spawn_command, spawn_arguments, {
 })
 
 STDIO_AGENT.on('error', error => {
-	console.error('Failed to start ACP agent:', error)
-	process.exit(1)
+	console.error('STDIO agent error:', error)
+	process.exit(constants.errno.ENOENT)
 })
 
 STDIO_AGENT.on('exit', (code, signal) => {
-	if (signal) {
-		console.error(`ACP agent exited after signal ${signal}`)
-	}
-
-	code ??= 1
+	console.error('STDIO agent signal:', signal)
+	code ??= constants.errno.ENOENT
 	process.exit(code)
 })
 
@@ -98,8 +101,8 @@ const WS_SERVER = new WebSocketServer({
 })
 
 WS_SERVER.on('error', error => {
-	console.error('ACP WebSocket server error:', error)
-	process.exit(1)
+	console.error('WebSocket server error:', error)
+	process.exit(constants.errno.EIO)
 })
 
 const CLIENT2AGENT_ID = new Map<WebSocket, Map<JsonRpcId, JsonRpcId>>()
@@ -153,16 +156,10 @@ function removeClient(client: WebSocket) {
 	prompt_responses = prompt_responses.filter(response => response.client != client)
 }
 
+const AGENT2CLIENT_REQUESTS = new Map<JsonRpcId, Agent2ClientRequest>()
 const IDLE_NEEDED = RequestError.invalidRequest(undefined, 'An idle session is needed to perform this action.').toErrorResponse()
 const INITIALIZE_RUNNING = RequestError.invalidRequest(undefined, 'Initialization is already in progress.').toErrorResponse()
 const SESSION_CREATING = RequestError.invalidRequest(undefined, 'The session is creating').toErrorResponse()
-
-interface Agent2ClientRequest {
-	client?: WebSocket
-	id?: JsonRpcId
-	request: AnyRequest
-}
-const AGENT2CLIENT_REQUESTS = new Map<JsonRpcId, Agent2ClientRequest>()
 
 let initialize_response: AnyResponse | undefined
 let session_load: LoadSessionRequest | undefined
@@ -463,4 +460,3 @@ for await (const message of readable) {
 	AGENT2CLIENT_REQUESTS.set(message.id, request)
 	requestClient(request)
 }
-process.exit(1)
