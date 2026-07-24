@@ -83,8 +83,8 @@ const STDIO_AGENT = spawn(spawn_command, spawn_arguments, {
 	stdio: ['overlapped', 'overlapped', 'inherit'],
 })
 
-STDIO_AGENT.on('error', error => {
-	console.error('STDIO agent error:', error)
+STDIO_AGENT.on('error', err => {
+	console.error('STDIO agent error:', err)
 	process.exit(constants.errno.ENOENT)
 })
 
@@ -183,6 +183,7 @@ WS_SERVER.on('connection', client => {
 		let id: JsonRpcId = null
 		try {
 			const message = JSON.parse(data.toString())
+			console.log('Client:', data)
 			if ('id' in message) {
 				id = message.id
 				if ('method' in message) {
@@ -352,6 +353,7 @@ WS_SERVER.on('connection', client => {
 })
 
 for await (const message of readable) {
+	console.log('Agent:', message)
 	if (!('id' in message)) {
 		if (!ws_client) continue
 		if (message.method == PROTOCOL_METHODS.cancel_request) {
