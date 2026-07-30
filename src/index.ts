@@ -183,7 +183,7 @@ WS_SERVER.on('connection', client => {
 		let id: JsonRpcId = null
 		try {
 			const message = JSON.parse(data.toString())
-			console.log('Client:', data)
+			console.log('Client:', message)
 			if ('id' in message) {
 				id = message.id
 				if ('method' in message) {
