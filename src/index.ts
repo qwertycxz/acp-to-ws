@@ -326,15 +326,24 @@ WS_SERVER.on('connection', client => {
 				}
 			} else {
 				if (client != ws_client) return
-				if (message.method == PROTOCOL_METHODS.cancel_request) {
-					const agent2client = AGENT2CLIENT_ID.get(client)?.get(message.params.requestId)
-					if (agent2client !== undefined) {
-						message.params.requestId = agent2client
-					} else {
-						const client2agent = CLIENT2AGENT_ID.get(client)?.get(message.params.requestId)
-						if (client2agent === undefined) return
-						message.params.requestId = client2agent
-					}
+				switch (message.method) {
+					case AGENT_METHODS.session_cancel:
+						if (!session_load) return
+						message.params = {
+							...message.params,
+							sessionId: session_load.sessionId,
+						}
+						break
+					case PROTOCOL_METHODS.cancel_request:
+						const agent2client = AGENT2CLIENT_ID.get(client)?.get(message.params.requestId)
+						if (agent2client !== undefined) {
+							message.params.requestId = agent2client
+						} else {
+							const client2agent = CLIENT2AGENT_ID.get(client)?.get(message.params.requestId)
+							if (client2agent === undefined) return
+							message.params.requestId = client2agent
+						}
+						break
 				}
 			}
 			void AGENT_STDIN.write(message)
