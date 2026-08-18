@@ -5,6 +5,7 @@ import { Readable, Writable } from 'node:stream'
 import { parseArgs } from 'node:util'
 import { AGENT_METHODS, type AnyMessage, type AnyRequest, type AnyResponse, type JsonRpcId, type LoadSessionRequest, type NewSessionRequest, ndJsonStream, PROTOCOL_METHODS, RequestError, type SessionId } from '@agentclientprotocol/sdk'
 import { type WebSocket, WebSocketServer } from 'ws'
+import PACKAGE from '../package.json' with { type: 'json' }
 
 function messageClient(client: WebSocket, message: Omit<AnyMessage, 'jsonrpc'>) {
 	client.send(
@@ -46,7 +47,7 @@ const DEFAULT_PORT = '80'
 
 const {
 	positionals: [spawn_command, ...spawn_arguments],
-	values: { help, host, port },
+	values: { help, host, port, version },
 } = parseArgs({
 	allowPositionals: true,
 	options: {
@@ -62,8 +63,17 @@ const {
 			default: DEFAULT_PORT,
 			type: 'string',
 		},
+		version: {
+			short: 'v',
+			type: 'boolean',
+		},
 	},
 })
+
+if (version) {
+	console.log(PACKAGE.version)
+	process.exit()
+}
 
 if (help || !spawn_command) {
 	console.error(`Usage:

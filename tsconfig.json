@@ -5,6 +5,7 @@
 		"allowUnusedLabels": false,
 		"exactOptionalPropertyTypes": true,
 		"lib": ["ESNext"],
+		"module": "esnext",
 		"noImplicitOverride": true,
 		"noImplicitReturns": true,
 		"noUnusedLocals": true,
