@@ -1,5 +1,27 @@
 # acp-to-ws
 
+[![GitHub commit activity](https://img.shields.io/github/commit-activity/t/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub commits since latest release](https://img.shields.io/github/commits-since/qwertycxz/acp-to-ws/latest)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub contributors](https://img.shields.io/github/contributors/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub Created At](https://img.shields.io/github/created-at/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub last commit](https://img.shields.io/github/last-commit/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![NPM Collaborators](https://img.shields.io/npm/collaborators/acp-to-ws)](https://www.npmjs.com/package/acp-to-ws)
+[![GitHub branch count](https://img.shields.io/github/branches/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub language count](https://img.shields.io/github/languages/count/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub top language](https://img.shields.io/github/languages/top/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub branch check suites](https://img.shields.io/github/check-suites/qwertycxz/acp-to-ws/master)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/qwertycxz/acp-to-ws/total)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/qwertycxz)](https://ko-fi.com/qwertycxz)
+[![GitHub Discussions (all)](https://img.shields.io/github/discussions/all/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub repo file or directory count](https://img.shields.io/github/directory-file-count/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub repo size](https://img.shields.io/github/repo-size/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![NPM Unpacked Size](https://img.shields.io/npm/unpacked-size/acp-to-ws)](https://www.npmjs.com/package/acp-to-ws)
+[![GitHub followers](https://img.shields.io/github/followers/qwertycxz)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub forks](https://img.shields.io/github/forks/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub User's stars](https://img.shields.io/github/stars/qwertycxz)](https://github.com/qwertycxz/acp-to-ws)
+[![GitHub watchers](https://img.shields.io/github/watchers/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
+
 `acp-to-ws` is an ACP (Agent Client Protocol) proxy. It starts an ACP Agent over standard input/output and exposes it to ACP Clients over WebSocket.
 
 ```text
@@ -134,6 +156,7 @@ Common commands:
 | `npm run format:check` | Check formatting                    |
 | `npm run lint`         | Check the code with Biome           |
 | `npm run lint:fix`     | Automatically fix applicable issues |
+| `npm run man`          | Generate man page                   |
 
 ## Contributor
 
