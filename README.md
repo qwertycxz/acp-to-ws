@@ -1,5 +1,6 @@
 # acp-to-ws
 
+<!-- prettier-ignore -->
 [![GitHub commit activity](https://img.shields.io/github/commit-activity/t/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)
 [![GitHub commits since latest release](https://img.shields.io/github/commits-since/qwertycxz/acp-to-ws/latest)](https://github.com/qwertycxz/acp-to-ws)
 [![GitHub contributors](https://img.shields.io/github/contributors/qwertycxz/acp-to-ws)](https://github.com/qwertycxz/acp-to-ws)

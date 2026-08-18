@@ -18,13 +18,11 @@
 		"typescript": "^7.0.2"
 	},
 	"directories": {
-		"man": "man",
-		"src": "src"
+		"man": "man"
 	},
 	"files": [
 		"dist",
-		"man",
-		"src"
+		"man"
 	],
 	"funding": "https://ko-fi.com/qwertycxz",
 	"keywords": [

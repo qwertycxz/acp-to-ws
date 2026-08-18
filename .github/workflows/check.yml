@@ -8,9 +8,9 @@ jobs:
         with:
           cache: npm
       - run: npm ci
-      - run: npm run lint
-      - run: npm run format
       - run: npm run build
+      - run: npm run format:check
+      - run: npm run lint
       - uses: actions/upload-artifact@main
         with:
           compression-level: 9
