@@ -7,11 +7,12 @@
 	"bugs": "https://github.com/qwertycxz/acp-to-ws/issues",
 	"dependencies": {
 		"@agentclientprotocol/sdk": "^1.3.0",
-		"ws": "^8.21.1"
+		"ws": "^8.21.3"
 	},
 	"description": "Redirect ACP to WebSocket",
 	"devDependencies": {
-		"@types/node": "^26.1.1",
+		"@biomejs/biome": "^2.5.9",
+		"@types/node": "^26.2.0",
 		"@types/ws": "^8.18.1",
 		"prettier": "^3.9.6",
 		"typescript": "^7.0.2"
@@ -23,7 +24,6 @@
 		"ws"
 	],
 	"license": "Apache-2.0",
-	"main": "./dist/index.js",
 	"name": "acp-to-ws",
 	"prettier": {
 		"arrowParens": "avoid",
@@ -47,7 +47,12 @@
 	"repository": "https://github.com/qwertycxz/acp-to-ws",
 	"scripts": {
 		"build": "tsc",
-		"check": "tsc --noEmit",
+		"clean": "tsc -b --clean",
+		"dev": "node --watch src/index.ts",
+		"format": "prettier -w .",
+		"format:check": "prettier -c .",
+		"lint": "biome check",
+		"lint:fix": "biome check --fix --unsafe",
 		"start": "node dist/index.js"
 	},
 	"type": "module",

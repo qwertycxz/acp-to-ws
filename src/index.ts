@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { AGENT_METHODS, ndJsonStream, PROTOCOL_METHODS, RequestError, type AnyMessage, type AnyRequest, type AnyResponse, type JsonRpcId, type LoadSessionRequest, type NewSessionRequest, type SessionId } from '@agentclientprotocol/sdk'
 import { spawn } from 'node:child_process'
 import { constants } from 'node:os'
 import { Readable, Writable } from 'node:stream'
 import { parseArgs } from 'node:util'
-import { WebSocket, WebSocketServer } from 'ws'
+import { AGENT_METHODS, type AnyMessage, type AnyRequest, type AnyResponse, type JsonRpcId, type LoadSessionRequest, type NewSessionRequest, ndJsonStream, PROTOCOL_METHODS, RequestError, type SessionId } from '@agentclientprotocol/sdk'
+import { type WebSocket, WebSocketServer } from 'ws'
 
 function messageClient(client: WebSocket, message: Omit<AnyMessage, 'jsonrpc'>) {
 	client.send(
@@ -21,14 +21,14 @@ interface Agent2ClientRequest {
 	id?: JsonRpcId
 	request: AnyRequest
 }
-let ws_client: WebSocket | undefined = undefined
+let ws_client: WebSocket | undefined
 
 function requestClient(request: Agent2ClientRequest) {
 	if (!ws_client) return
 	request.client = ws_client
 	request.id = crypto.randomUUID()
 
-	let requests = AGENT2CLIENT_ID.get(ws_client)
+	const requests = AGENT2CLIENT_ID.get(ws_client)
 	if (requests) {
 		requests.set(request.id, request.request.id)
 	} else {
@@ -90,14 +90,13 @@ STDIO_AGENT.on('error', err => {
 
 STDIO_AGENT.on('exit', (code, signal) => {
 	console.error('STDIO agent signal:', signal)
-	code ??= constants.errno.ENOENT
-	process.exit(code)
+	process.exit(code ?? constants.errno.ENOENT)
 })
 
 const WS_SERVER = new WebSocketServer({
 	host,
 	perMessageDeflate: true,
-	port: parseInt(port),
+	port: parseInt(port, 10),
 })
 
 WS_SERVER.on('error', error => {
@@ -110,18 +109,18 @@ type Client2AgentRequest = {
 	client: WebSocket
 	id: JsonRpcId
 } & (
-		| {
+	| {
 			kind: 'initialize-request' | 'other-request' | 'session-load' | 'session-prompt' | 'session-resume'
-		}
-		| {
+	  }
+	| {
 			kind: 'prompt-load' | 'prompt-new' | 'prompt-resume'
 			session: SessionId
-		}
-		| {
+	  }
+	| {
 			kind: 'session-new'
 			request: NewSessionRequest
-		}
-	)
+	  }
+)
 const CLIENT2AGENT_REQUESTS = new Map<JsonRpcId, Client2AgentRequest>()
 const CONNECTION_REPLACED = new RequestError(-32010, 'A newer connection has been established. Please close this connection and reconnect.').toErrorResponse()
 
@@ -185,6 +184,7 @@ WS_SERVER.on('connection', client => {
 			const message = JSON.parse(data.toString())
 			console.log('Client:', message)
 			if ('id' in message) {
+				// biome-ignore lint/style/useDestructuring: destructuring here would make the code less readable
 				id = message.id
 				if ('method' in message) {
 					if (client != ws_client) {
@@ -309,7 +309,7 @@ WS_SERVER.on('connection', client => {
 					}
 
 					CLIENT2AGENT_REQUESTS.set(message.id, request)
-					let requests = CLIENT2AGENT_ID.get(client)
+					const requests = CLIENT2AGENT_ID.get(client)
 					if (requests) {
 						requests.set(id, message.id)
 					} else {
@@ -334,16 +334,17 @@ WS_SERVER.on('connection', client => {
 							sessionId: session_load.sessionId,
 						}
 						break
-					case PROTOCOL_METHODS.cancel_request:
+					case PROTOCOL_METHODS.cancel_request: {
 						const agent2client = AGENT2CLIENT_ID.get(client)?.get(message.params.requestId)
-						if (agent2client !== undefined) {
-							message.params.requestId = agent2client
-						} else {
+						if (agent2client === undefined) {
 							const client2agent = CLIENT2AGENT_ID.get(client)?.get(message.params.requestId)
 							if (client2agent === undefined) return
 							message.params.requestId = client2agent
+						} else {
+							message.params.requestId = agent2client
 						}
 						break
+					}
 				}
 			}
 			void AGENT_STDIN.write(message)
