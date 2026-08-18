@@ -2,7 +2,7 @@
 	"$schema": "https://schemastore.org/package",
 	"author": "qwertycxz",
 	"bin": {
-		"acp-to-ws": "./dist/index.js"
+		"acp-to-ws": "dist/index.js"
 	},
 	"bugs": "https://github.com/qwertycxz/acp-to-ws/issues",
 	"dependencies": {
@@ -17,6 +17,15 @@
 		"prettier": "^3.9.6",
 		"typescript": "^7.0.2"
 	},
+	"directories": {
+		"man": "man",
+		"src": "src"
+	},
+	"files": [
+		"dist",
+		"man",
+		"src"
+	],
 	"funding": "https://ko-fi.com/qwertycxz",
 	"keywords": [
 		"acp",
@@ -53,6 +62,7 @@
 		"format:check": "prettier -c .",
 		"lint": "biome check",
 		"lint:fix": "biome check --fix --unsafe",
+		"man": "mkdir man && pandoc README.md -o man/pm2-logs-attach-input.1",
 		"start": "node dist/index.js"
 	},
 	"type": "module",
