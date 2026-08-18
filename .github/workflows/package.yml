@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-node@main
         with:
           registry-url: https://npm.pkg.github.com
-          scope: '@${{ github.repository_owner }}'
+      - run: npm init -y --scope ${{ github.repository_owner }}
       - env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish
