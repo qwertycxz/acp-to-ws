@@ -6,7 +6,7 @@
 	},
 	"bugs": "https://github.com/qwertycxz/acp-to-ws/issues",
 	"dependencies": {
-		"@agentclientprotocol/sdk": "^2.8.0",
+		"@agentclientprotocol/sdk": "^2.9.1",
 		"ws": "^8.23.0"
 	},
 	"description": "Redirect ACP to WebSocket",
